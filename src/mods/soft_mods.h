@@ -29,11 +29,17 @@ const soft_mods_config_t* soft_mods_get_config(void);
 // Apply guest memory patches once after ELF loading
 void soft_mods_apply_patches(elf32_image_t *img);
 
-// Apply active HUD soft-mods on each frame when p0_hud is available
-void soft_mods_apply_hud(elf32_image_t *img, uint32_t p0_hud, uint32_t p0_scene);
+// Apply active HUD soft-mods on each frame when p0 is available
+void soft_mods_apply_hud(elf32_image_t *img, uint32_t p0, uint32_t p0_hud, uint32_t p0_scene);
+
+// Update or evaluate active gameplay state using authoritative MainAI state machine
+void soft_mods_update_gameplay_state(elf32_image_t *img, uint32_t p0, uint32_t p0_scene);
 
 // Patch compressed texture in-place if Clean Shop mod is enabled and texture matches UI_mainmenu_store
 void soft_mods_patch_compressed_texture(int level, int w, int h, int imageSize, void *data);
+
+// Returns true if the game is currently in active gameplay (in-game level with controls active and unpaused)
+bool soft_mods_is_in_gameplay(void);
 
 #ifdef __cplusplus
 }

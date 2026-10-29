@@ -22,6 +22,10 @@ void GameConfig::reset_to_defaults() {
     height = 720;
     fullscreen = false;
     vsync = true;
+    vsync_mode = 0;
+    present_delay_ms = 0.0f;
+    perf_log = false;
+    perf_profile = false;
     fps_limit = 60;
     msaa = 8;
     anisotropic = 16;
@@ -29,6 +33,7 @@ void GameConfig::reset_to_defaults() {
     mod_clean_main_menu = true;
     mod_clean_shop = true;
     mod_clean_level_complete = true;
+    mod_clean_touch_hud = true;
 
     // Movement / Navigation (WASD primary, Arrows secondary)
     key_up = SDL_SCANCODE_W;
@@ -162,6 +167,10 @@ bool GameConfig::load(const char *path) {
             else if (strcmp(key, "Height") == 0) height = atoi(val);
             else if (strcmp(key, "Fullscreen") == 0) fullscreen = (atoi(val) != 0);
             else if (strcmp(key, "VSync") == 0) vsync = (atoi(val) != 0);
+            else if (strcmp(key, "VSyncMode") == 0) vsync_mode = atoi(val);
+            else if (strcmp(key, "PresentDelayMs") == 0) present_delay_ms = (float)atof(val);
+            else if (strcmp(key, "PerfLog") == 0) perf_log = (atoi(val) != 0);
+            else if (strcmp(key, "PerfProfile") == 0) perf_profile = (atoi(val) != 0);
             else if (strcmp(key, "FPSLimit") == 0 || strcmp(key, "FpsLimit") == 0 || strcmp(key, "FPS_Limit") == 0) fps_limit = atoi(val);
             else if (strcmp(key, "MSAA") == 0) msaa = atoi(val);
             else if (strcmp(key, "Anisotropic") == 0) anisotropic = atoi(val);
@@ -216,6 +225,9 @@ bool GameConfig::load(const char *path) {
     // Sanity clamping
     if (width < 640) width = 1280;
     if (height < 360) height = 720;
+    if (vsync_mode < 0 || vsync_mode > 2) vsync_mode = 0;
+    if (!(present_delay_ms >= 0.0f)) present_delay_ms = 0.0f;
+    if (present_delay_ms > 12.0f) present_delay_ms = 12.0f;
     if (fps_limit < 0) fps_limit = 60;
     if (fps_limit > 360) fps_limit = 360;
     if (msaa < 0) msaa = 0;
@@ -236,13 +248,17 @@ bool GameConfig::save(const char *path) const {
         return false;
     }
 
-    fprintf(f, "; Prince of Persia: The Shadow and the Flame PC Port Configuration\n\n");
+    fprintf(f, "; Prince of Persia: Shadow and the Flame - Reignited Configuration\n\n");
 
     fprintf(f, "[Graphics]\n");
     fprintf(f, "Width = %d\n", width);
     fprintf(f, "Height = %d\n", height);
     fprintf(f, "Fullscreen = %d\n", fullscreen ? 1 : 0);
     fprintf(f, "VSync = %d\n", vsync ? 1 : 0);
+    fprintf(f, "VSyncMode = %d\n", vsync_mode);
+    fprintf(f, "PresentDelayMs = %.1f\n", present_delay_ms);
+    fprintf(f, "PerfLog = %d\n", perf_log ? 1 : 0);
+    fprintf(f, "PerfProfile = %d\n", perf_profile ? 1 : 0);
     fprintf(f, "FPSLimit = %d\n", fps_limit);
     fprintf(f, "MSAA = %d\n", msaa);
     fprintf(f, "Anisotropic = %d\n", anisotropic);

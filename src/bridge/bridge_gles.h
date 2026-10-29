@@ -25,6 +25,12 @@ void bridge_gles_set_viewport_scaling(int enabled, int render_w, int render_h,
                                       int dst_x, int dst_y, int dst_w, int dst_h);
 void bridge_gles_render_letterbox_bars(int window_w, int window_h);
 void bridge_gles_set_debug_mode(int enabled);
+/* Offscreen (optionally multisampled) framebuffer for drivers whose window framebuffer lacks MSAA / VSync.
+ * init returns the sample count in use, or -1 if unavailable (window framebuffer is used directly). */
+int  bridge_gles_offscreen_init(int render_w, int render_h, int samples);
+int  bridge_gles_offscreen_active(void);
+void bridge_gles_present(int window_w, int window_h);
+void bridge_gles_begin_frame(void);
 extern float g_max_anisotropy;
 
 #ifdef __cplusplus

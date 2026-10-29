@@ -61,7 +61,7 @@ cmake --build build_app
 cmake -B build_app -G Ninja -DCMAKE_BUILD_TYPE=Debug -DENABLE_DEBUG=ON
 cmake --build build_app
 ```
-This compiles `src/`, links against the vendored libraries (Dynarmic, SDL2, OpenAL, OpenGL), and auto-deploys `PoPSnF_PC.exe`, `PoPSnF_Launcher.exe`, `SDL2.dll`, and `OpenAL32.dll` directly into `game/`.
+This compiles `src/`, links against the vendored libraries (Dynarmic, SDL2, OpenAL, OpenGL), and auto-deploys `PoPSnF_Reignited.exe`, `PoPSnF_Launcher.exe`, `SDL2.dll`, and `OpenAL32.dll` directly into `game/`.
 
 ## Provide the Original Game Data (1-Click APK Extraction)
 A legally obtained copy of the original Android release (`.apk` file) is required:
@@ -89,7 +89,7 @@ From here you can customize display resolutions (up to 4K), toggle Fullscreen/VS
 
 Or start the game directly:
 ```powershell
-.\game\PoPSnF_PC.exe
+.\game\PoPSnF_Reignited.exe
 ```
 
 ---

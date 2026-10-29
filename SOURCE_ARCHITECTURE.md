@@ -1,4 +1,4 @@
-# Prince of Persia: SnF PC Port - Source Code & Architecture Guide
+# Prince of Persia: Shadow and the Flame - Reignited - Source Code & Architecture Guide
 
 > **Target Audience**: Anyone curious about how this PC port works - whether you are an experienced software engineer, a speedrunner, or someone who has **never written or seen a line of C or C++ in your life**.
 
@@ -78,7 +78,7 @@ flowchart TD
     end
 
     %% 3. PC Engine Host Layer
-    subgraph S3 ["3. Host Engine (PoPSnF_PC.exe)"]
+    subgraph S3 ["3. Host Engine (PoPSnF_Reignited.exe)"]
         Main["src/main.cpp<br/>(SDL2 Window, Clock & Input Loop)"]
         Dynarmic["Dynarmic JIT Core<br/>(ARMv7 to x86_64 Translation)"]
         Main -->|"60 FPS Tick"| Dynarmic
@@ -253,7 +253,7 @@ Impersonates Android JavaVM/JNIEnv with 160+ protected function pointer slots, a
 Contains 27,216 bytes of pre-compressed DXT5 texture data restoring the red curved back button on menu screens.
 
 ### `CMakeLists.txt` - The Construction Recipe
-Configures C++20 compiler flags, defines include search directories, links `libdynarmic.a`, SDL2, OpenAL, OpenGL, and ImGui, compiles both `PoPSnF_PC.exe` and `PoPSnF_Launcher.exe`, and auto-deploys runtime binaries and libraries into `game/` post-build.
+Configures C++20 compiler flags, defines include search directories, links `libdynarmic.a`, SDL2, OpenAL, OpenGL, and ImGui, compiles both `PoPSnF_Reignited.exe` and `PoPSnF_Launcher.exe`, and auto-deploys runtime binaries and libraries into `game/` post-build.
 
 ---
 

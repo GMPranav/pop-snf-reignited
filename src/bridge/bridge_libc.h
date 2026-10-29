@@ -35,6 +35,9 @@ uint64_t bridge_libc_get_malloc_count(void);
 uint64_t bridge_libc_get_free_count(void);
 uint32_t bridge_libc_get_stk_vfd_count(void);
 
+/* Clean up in-memory temporary VFS buffers */
+void bridge_libc_cleanup_mem_vfs(void);
+
 /* Diagnostics: call periodically (e.g. once per second) from the main loop.
  * Prints net malloc/free/mmap accounting - cheap, safe to call often. */
 void bridge_libc_dump_mem_report(void);

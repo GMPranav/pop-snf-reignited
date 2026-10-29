@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(PoPSnF_PC C CXX)
+project(PoPSnF_Reignited C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -51,7 +51,17 @@ set(SOURCES
     src/mods/soft_mods.cpp
 )
 
-add_executable(PoPSnF_PC ${SOURCES})
+if(WIN32)
+    add_custom_command(
+        OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/app.res.obj"
+        COMMAND "${CMAKE_RC_COMPILER}" -i "app.rc" -o "${CMAKE_CURRENT_BINARY_DIR}/app.res.obj"
+        DEPENDS "${CMAKE_SOURCE_DIR}/src/res/app.rc" "${CMAKE_SOURCE_DIR}/src/res/app_icon.ico"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/src/res"
+    )
+    list(APPEND SOURCES "${CMAKE_CURRENT_BINARY_DIR}/app.res.obj")
+endif()
+
+add_executable(PoPSnF_Reignited ${SOURCES})
 
 # Platform-specific library configuration
 if(WIN32)
@@ -69,7 +79,7 @@ elseif(UNIX AND NOT APPLE)
     set(PLATFORM_LIBS GL)
 endif()
 
-target_link_libraries(PoPSnF_PC PRIVATE
+target_link_libraries(PoPSnF_Reignited PRIVATE
     ${DYNARMIC_LIB}
     ${SDL2_LIB}
     ${OPENAL_LIB}
@@ -95,6 +105,16 @@ set(LAUNCHER_SOURCES
     third_party/lzma/LzmaDec.c
 )
 
+if(WIN32)
+    add_custom_command(
+        OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/launcher.res.obj"
+        COMMAND "${CMAKE_RC_COMPILER}" -i "launcher.rc" -o "${CMAKE_CURRENT_BINARY_DIR}/launcher.res.obj"
+        DEPENDS "${CMAKE_SOURCE_DIR}/src/res/launcher.rc" "${CMAKE_SOURCE_DIR}/src/res/app_icon.ico"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/src/res"
+    )
+    list(APPEND LAUNCHER_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/launcher.res.obj")
+endif()
+
 add_executable(PoPSnF_Launcher ${LAUNCHER_SOURCES})
 
 target_link_libraries(PoPSnF_Launcher PRIVATE
@@ -104,27 +124,28 @@ target_link_libraries(PoPSnF_Launcher PRIVATE
 )
 
 # In production builds, suppress the extra console/terminal window by targeting the Windows GUI subsystem
+# and strip all debug symbol tables for lean, high-performance release binaries
 if(WIN32)
     if(NOT (ENABLE_DEBUG OR DEBUG OR CMAKE_BUILD_TYPE STREQUAL "Debug"))
-        set_target_properties(PoPSnF_PC PROPERTIES WIN32_EXECUTABLE TRUE)
-        set_target_properties(PoPSnF_Launcher PROPERTIES WIN32_EXECUTABLE TRUE)
+        set_target_properties(PoPSnF_Reignited PROPERTIES WIN32_EXECUTABLE TRUE LINK_FLAGS "-s")
+        set_target_properties(PoPSnF_Launcher PROPERTIES WIN32_EXECUTABLE TRUE LINK_FLAGS "-s")
     endif()
 endif()
 
 if(WIN32)
     # Copy required DLLs and deploy executables to game/ directory
-    add_custom_command(TARGET PoPSnF_PC POST_BUILD
+    add_custom_command(TARGET PoPSnF_Reignited POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/third_party/SDL2/x86_64-w64-mingw32/bin/SDL2.dll"
-            "$<TARGET_FILE_DIR:PoPSnF_PC>"
+            "$<TARGET_FILE_DIR:PoPSnF_Reignited>"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/third_party/openal/bin/Win64/soft_oal.dll"
-            "$<TARGET_FILE_DIR:PoPSnF_PC>/OpenAL32.dll"
+            "$<TARGET_FILE_DIR:PoPSnF_Reignited>/OpenAL32.dll"
         COMMAND ${CMAKE_COMMAND} -E make_directory
             "${CMAKE_SOURCE_DIR}/game"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:PoPSnF_PC>"
-            "${CMAKE_SOURCE_DIR}/game/PoPSnF_PC.exe"
+            "$<TARGET_FILE:PoPSnF_Reignited>"
+            "${CMAKE_SOURCE_DIR}/game/PoPSnF_Reignited.exe"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/third_party/SDL2/x86_64-w64-mingw32/bin/SDL2.dll"
             "${CMAKE_SOURCE_DIR}/game/SDL2.dll"

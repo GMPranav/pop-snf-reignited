@@ -33,6 +33,10 @@ struct GameConfig {
     int height = 720;
     bool fullscreen = false;
     bool vsync = true;
+    bool perf_profile = false;  // with PerfLog: time every engine->host call and attribute slow frames (small overhead)
+    bool perf_log = false;     // write logs/perf_<date>.log (frame times, spikes, causes) every run
+    float present_delay_ms = 0.0f; // wait this long after the compositor sync before presenting (config.ini only, 0-12)
+    int vsync_mode = 0;        // 0 = auto, 1 = force driver swap interval, 2 = force DWM flush pacing (config.ini only)
     int fps_limit = 60;         // 0 (unlimited), 30, 60, 120, 144, 165, 240
     int msaa = 8;               // 0 (off), 2, 4, 8
     int anisotropic = 16;       // 1 (off), 2, 4, 8, 16

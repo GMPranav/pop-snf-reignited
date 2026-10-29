@@ -1,6 +1,10 @@
-# Prince of Persia: The Shadow and the Flame - Native PC Port
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/4e699269-2891-492f-ba04-183184f5f0b5" alt="Prince of Persia: Shadow and the Flame - Reignited" width="512" />
+</p>
 
-An authentic, native Windows x64 PC port of **Prince of Persia: The Shadow and the Flame** (ShiVa3D engine Android/iOS remake), running natively via Dynarmic ARMv7 JIT dynamic binary retranslation, Desktop OpenGL, OpenAL, and SDL2.
+# Prince of Persia: Shadow and the Flame - Reignited
+
+An authentic, native Windows x64 PC port of **Prince of Persia: Shadow and the Flame - Reignited** (ShiVa3D engine Android/iOS remake), running natively via Dynarmic ARMv7 JIT dynamic binary retranslation, Desktop OpenGL, OpenAL, and SDL2.
 
 ---
 
@@ -136,7 +140,7 @@ cmake --build build_app
 cmake -B build_app -G Ninja -DCMAKE_BUILD_TYPE=Debug -DENABLE_DEBUG=ON
 cmake --build build_app
 ```
-*CMake compiles both `PoPSnF_PC.exe` and `PoPSnF_Launcher.exe`, links against vendored libraries, and auto-deploys them alongside `SDL2.dll` and `OpenAL32.dll` directly into `game/`.*
+*CMake compiles both `PoPSnF_Reignited.exe` and `PoPSnF_Launcher.exe`, links against vendored libraries, and auto-deploys them alongside `SDL2.dll` and `OpenAL32.dll` directly into `game/`.*
 
 ---
 
@@ -151,10 +155,10 @@ If you haven't extracted your assets yet, the launcher will prompt you to select
 ### Direct Execution:
 ```powershell
 # Standard production run (clean, silent, high-performance):
-.\game\PoPSnF_PC.exe
+.\game\PoPSnF_Reignited.exe
 
 # Or enable runtime debug diagnostics & telemetry on demand:
-.\game\PoPSnF_PC.exe --debug
+.\game\PoPSnF_Reignited.exe --debug
 ```
 
 In production mode, the game runs silently with zero logging overhead. When `--debug` is specified (or when compiled in Debug mode), telemetry, per-second frame diagnostics, and profiler logs display in your console and write to `logs/pop_pc_*.log` and `logs/perf.log`. Framebuffer captures can be taken at any time with `F12` and are saved to `screenshots/`.

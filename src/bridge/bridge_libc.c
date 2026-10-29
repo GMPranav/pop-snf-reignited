@@ -24,6 +24,7 @@ int g_has_guest_ret_r1 = 0;
 static char g_root_dir[PATH_MAX] = ".";
 
 static void stk_slots_init(void); /* forward declaration */
+static void mem_vfs_init(void);   /* forward declaration */
 
 void bridge_libc_set_root_dir(const char *path) {
     strncpy(g_root_dir, path, sizeof(g_root_dir) - 1);
@@ -31,6 +32,7 @@ void bridge_libc_set_root_dir(const char *path) {
     _setmaxstdio(2048);
 #endif
     stk_slots_init();
+    mem_vfs_init();
 }
 
 #define G_PTR(addr) (((addr) && (uint32_t)(addr) < img->mem_size) ? (img->mem + (addr)) : NULL)
@@ -1133,6 +1135,287 @@ static uint32_t stk_vfd_open(void) {
     return STK_VFD_BASE + (uint32_t)slot;
 }
 
+/* -----------------------------------------------------------------------
+ * In-memory Virtual File System (VFS) for temporary files (~temp*.xkv, etc.)
+ *
+ * During startup and shop initialization (aiStoreAndInv), the game decrypts
+ * XML store definitions into "~tempgd!ms!k!gr!c!m!gff!crs.xkv" (offers) and
+ * "~tempgd!ms!k!gr!c!m!n!g!q.xkv" (weapon catalog), writes them via fopen,
+ * parses them via xml.parseFile, and neglects to delete them from disk.
+ *
+ * In addition, the engine attempts to create "./.nomedia" (Android media scanner
+ * exclusion file, completely useless on Windows).
+ *
+ * We virtualize both:
+ * 1) Any path containing ".nomedia" is directed to the system null device
+ *    ("nul" on Windows) so 0 files are written to disk.
+ * 2) Any temporary XML file (~temp*.xkv) is captured into an in-memory VFS
+ *    buffer in RAM. The XML parser reads it directly from memory without
+ *    ever touching the physical hard drive.
+ * ----------------------------------------------------------------------- */
+#define MEM_VFD_BASE   0x20000u
+#define MAX_MEM_VFDS   64
+#define MAX_MEM_FILES  16
+
+typedef struct {
+    char name[128];
+    uint8_t *data;
+    size_t size;
+    size_t capacity;
+} mem_vfs_file_t;
+
+typedef struct {
+    int file_idx;    /* index in s_mem_vfs_files, -1 if closed */
+    size_t pos;      /* current cursor offset */
+    int is_write;    /* 1 if opened for write */
+} mem_vfs_slot_t;
+
+static mem_vfs_file_t s_mem_vfs_files[MAX_MEM_FILES];
+static mem_vfs_slot_t s_mem_vfs_slots[MAX_MEM_VFDS];
+
+static void mem_vfs_init(void) {
+    for (int i = 0; i < MAX_MEM_VFDS; ++i) {
+        s_mem_vfs_slots[i].file_idx = -1;
+        s_mem_vfs_slots[i].pos = 0;
+        s_mem_vfs_slots[i].is_write = 0;
+    }
+}
+
+void bridge_libc_cleanup_mem_vfs(void) {
+    for (int i = 0; i < MAX_MEM_FILES; ++i) {
+        if (s_mem_vfs_files[i].data) {
+            free(s_mem_vfs_files[i].data);
+            s_mem_vfs_files[i].data = NULL;
+        }
+        s_mem_vfs_files[i].size = 0;
+        s_mem_vfs_files[i].capacity = 0;
+        s_mem_vfs_files[i].name[0] = '\0';
+    }
+    mem_vfs_init();
+}
+
+static inline int is_mem_vfd(uint32_t fd) {
+    return (fd >= MEM_VFD_BASE && fd < MEM_VFD_BASE + MAX_MEM_VFDS);
+}
+
+static const char *get_path_basename(const char *path) {
+    if (!path) return "";
+    const char *p1 = strrchr(path, '/');
+    const char *p2 = strrchr(path, '\\');
+    const char *base = p1 > p2 ? p1 : p2;
+    return base ? base + 1 : path;
+}
+
+static inline int is_nomedia_path(const char *path, const char *raw_path) {
+    if (path && (strstr(path, ".nomedia") || strstr(path, "nomedia"))) return 1;
+    if (raw_path && (strstr(raw_path, ".nomedia") || strstr(raw_path, "nomedia"))) return 1;
+    return 0;
+}
+
+static inline int is_temp_vfs_path(const char *path, const char *raw_path) {
+    if (path && (strstr(path, "~temp") || strstr(path, ".xkv"))) return 1;
+    if (raw_path && (strstr(raw_path, "~temp") || strstr(raw_path, ".xkv"))) return 1;
+    return 0;
+}
+
+static FILE *open_null_device(const char *mode) {
+#ifdef _WIN32
+    return fopen("nul", mode);
+#else
+    return fopen("/dev/null", mode);
+#endif
+}
+
+static uint32_t mem_vfs_open(const char *path, const char *mode) {
+    if (!path || !mode) return 0;
+    const char *base = get_path_basename(path);
+    int is_write = (strchr(mode, 'w') != NULL || strchr(mode, 'a') != NULL);
+
+    int f_idx = -1;
+    for (int i = 0; i < MAX_MEM_FILES; ++i) {
+        if (s_mem_vfs_files[i].name[0] && strcmp(s_mem_vfs_files[i].name, base) == 0) {
+            f_idx = i;
+            break;
+        }
+    }
+
+    if (is_write) {
+        if (f_idx == -1) {
+            for (int i = 0; i < MAX_MEM_FILES; ++i) {
+                if (!s_mem_vfs_files[i].name[0]) {
+                    f_idx = i;
+                    strncpy(s_mem_vfs_files[i].name, base, sizeof(s_mem_vfs_files[i].name) - 1);
+                    break;
+                }
+            }
+        }
+        if (f_idx == -1) {
+            f_idx = 0;
+            strncpy(s_mem_vfs_files[0].name, base, sizeof(s_mem_vfs_files[0].name) - 1);
+        }
+        s_mem_vfs_files[f_idx].size = 0;
+    } else {
+        if (f_idx == -1) return 0; /* File does not exist for reading */
+    }
+
+    for (int h = 0; h < MAX_MEM_VFDS; ++h) {
+        if (s_mem_vfs_slots[h].file_idx == -1) {
+            s_mem_vfs_slots[h].file_idx = f_idx;
+            s_mem_vfs_slots[h].pos = 0;
+            s_mem_vfs_slots[h].is_write = is_write;
+            return MEM_VFD_BASE + (uint32_t)h;
+        }
+    }
+    return 0;
+}
+
+static void mem_vfs_close(uint32_t fd) {
+    if (!is_mem_vfd(fd)) return;
+    int h = (int)(fd - MEM_VFD_BASE);
+    s_mem_vfs_slots[h].file_idx = -1;
+    s_mem_vfs_slots[h].pos = 0;
+}
+
+static size_t mem_vfs_write(uint32_t fd, const void *src, size_t size) {
+    if (!is_mem_vfd(fd) || !src || size == 0) return 0;
+    int h = (int)(fd - MEM_VFD_BASE);
+    int f_idx = s_mem_vfs_slots[h].file_idx;
+    if (f_idx < 0 || f_idx >= MAX_MEM_FILES) return 0;
+
+    mem_vfs_file_t *file = &s_mem_vfs_files[f_idx];
+    size_t needed = s_mem_vfs_slots[h].pos + size;
+    if (needed > file->capacity) {
+        size_t new_cap = file->capacity ? file->capacity * 2 : 16384;
+        while (new_cap < needed) new_cap *= 2;
+        uint8_t *new_data = (uint8_t*)realloc(file->data, new_cap);
+        if (!new_data) return 0;
+        file->data = new_data;
+        file->capacity = new_cap;
+    }
+
+    memcpy(file->data + s_mem_vfs_slots[h].pos, src, size);
+    s_mem_vfs_slots[h].pos += size;
+    if (s_mem_vfs_slots[h].pos > file->size) {
+        file->size = s_mem_vfs_slots[h].pos;
+    }
+    return size;
+}
+
+static size_t mem_vfs_read(uint32_t fd, void *dst, size_t size) {
+    if (!is_mem_vfd(fd) || !dst || size == 0) return 0;
+    int h = (int)(fd - MEM_VFD_BASE);
+    int f_idx = s_mem_vfs_slots[h].file_idx;
+    if (f_idx < 0 || f_idx >= MAX_MEM_FILES) return 0;
+
+    mem_vfs_file_t *file = &s_mem_vfs_files[f_idx];
+    if (s_mem_vfs_slots[h].pos >= file->size) return 0;
+
+    size_t avail = file->size - s_mem_vfs_slots[h].pos;
+    if (size > avail) size = avail;
+    memcpy(dst, file->data + s_mem_vfs_slots[h].pos, size);
+    s_mem_vfs_slots[h].pos += size;
+    return size;
+}
+
+static int mem_vfs_seek(uint32_t fd, int64_t offset, int whence) {
+    if (!is_mem_vfd(fd)) return -1;
+    int h = (int)(fd - MEM_VFD_BASE);
+    int f_idx = s_mem_vfs_slots[h].file_idx;
+    if (f_idx < 0 || f_idx >= MAX_MEM_FILES) return -1;
+
+    mem_vfs_file_t *file = &s_mem_vfs_files[f_idx];
+    int64_t base = 0;
+    if (whence == SEEK_SET) base = 0;
+    else if (whence == SEEK_CUR) base = (int64_t)s_mem_vfs_slots[h].pos;
+    else if (whence == SEEK_END) base = (int64_t)file->size;
+    else return -1;
+
+    int64_t new_pos = base + offset;
+    if (new_pos < 0) new_pos = 0;
+    if ((size_t)new_pos > file->size) new_pos = file->size;
+    s_mem_vfs_slots[h].pos = (size_t)new_pos;
+    return 0;
+}
+
+static int64_t mem_vfs_tell(uint32_t fd) {
+    if (!is_mem_vfd(fd)) return -1;
+    int h = (int)(fd - MEM_VFD_BASE);
+    return (int64_t)s_mem_vfs_slots[h].pos;
+}
+
+static int mem_vfs_getc(uint32_t fd) {
+    uint8_t c;
+    if (mem_vfs_read(fd, &c, 1) == 1) return (int)c;
+    return -1;
+}
+
+static int mem_vfs_putc(uint32_t fd, int c) {
+    uint8_t ch = (uint8_t)c;
+    if (mem_vfs_write(fd, &ch, 1) == 1) return (int)ch;
+    return -1;
+}
+
+static char *mem_vfs_gets(uint32_t fd, char *buf, int max_len) {
+    if (max_len <= 1 || !buf) return NULL;
+    int i = 0;
+    while (i < max_len - 1) {
+        int c = mem_vfs_getc(fd);
+        if (c < 0) {
+            if (i == 0) return NULL;
+            break;
+        }
+        buf[i++] = (char)c;
+        if (c == '\n') break;
+    }
+    buf[i] = '\0';
+    return buf;
+}
+
+static int mem_vfs_puts(uint32_t fd, const char *str) {
+    if (!str) return -1;
+    size_t len = strlen(str);
+    return (mem_vfs_write(fd, str, len) == len) ? 0 : -1;
+}
+
+static size_t mem_vfs_size(uint32_t fd) {
+    if (!is_mem_vfd(fd)) return 0;
+    int h = (int)(fd - MEM_VFD_BASE);
+    int f_idx = s_mem_vfs_slots[h].file_idx;
+    if (f_idx >= 0 && f_idx < MAX_MEM_FILES) {
+        return s_mem_vfs_files[f_idx].size;
+    }
+    return 0;
+}
+
+static int mem_vfs_stat_path(const char *path, size_t *out_size) {
+    if (!path) return 0;
+    const char *base = get_path_basename(path);
+    for (int i = 0; i < MAX_MEM_FILES; ++i) {
+        if (s_mem_vfs_files[i].name[0] && strcmp(s_mem_vfs_files[i].name, base) == 0) {
+            if (out_size) *out_size = s_mem_vfs_files[i].size;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void mem_vfs_delete(const char *path) {
+    if (!path) return;
+    const char *base = get_path_basename(path);
+    for (int i = 0; i < MAX_MEM_FILES; ++i) {
+        if (s_mem_vfs_files[i].name[0] && strcmp(s_mem_vfs_files[i].name, base) == 0) {
+            if (s_mem_vfs_files[i].data) {
+                free(s_mem_vfs_files[i].data);
+                s_mem_vfs_files[i].data = NULL;
+            }
+            s_mem_vfs_files[i].size = 0;
+            s_mem_vfs_files[i].capacity = 0;
+            s_mem_vfs_files[i].name[0] = '\0';
+            break;
+        }
+    }
+}
+
 /* --------------------------
  * Real FD table helpers
  * -------------------------- */
@@ -1331,6 +1614,26 @@ static uint32_t wrap_fopen(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_
     char path[PATH_MAX];
     sanitize_path(path, raw_path, sizeof(path));
 
+    /* --- Android .nomedia exclusion file: redirect to null device --- */
+    if (is_nomedia_path(path, raw_path)) {
+        FILE *nf = open_null_device(mode);
+        if (nf) {
+            uint32_t fd = alloc_fd(nf);
+            if (fd) return fd;
+            fclose(nf);
+        }
+        return 0;
+    }
+
+    /* --- Virtual In-Memory Temporary Files (~temp*.xkv) --- */
+    if (is_temp_vfs_path(path, raw_path)) {
+        uint32_t vfd = mem_vfs_open(path, mode);
+        if (!vfd && raw_path && strcmp(path, raw_path) != 0) {
+            vfd = mem_vfs_open(raw_path, mode);
+        }
+        return vfd;
+    }
+
     /* --- Primary Asset Archive: intercept opens of S3DMain.stk --- */
     if (path_is_stk(path) || path_is_stk(raw_path)) {
         /* Open the real FILE* once and reuse it forever */
@@ -1386,6 +1689,10 @@ static uint32_t wrap_fopen(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_
 }
 
 static uint32_t wrap_fclose(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
+    if (is_mem_vfd(r0)) {
+        mem_vfs_close(r0);
+        return 0;
+    }
     /* Virtual STK handle: just free the slot, don't close the shared FILE* */
     if (is_stk_vfd(r0)) {
         int s = stk_slot(r0);
@@ -1414,6 +1721,12 @@ static int64_t stk_seek_to(int slot) {
 }
 
 static uint32_t wrap_fread(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
+    if (is_mem_vfd(r3)) {
+        if (!r0 || r1 == 0 || r2 == 0) return 0;
+        size_t total_bytes = (size_t)r1 * (size_t)r2;
+        size_t bytes_read = mem_vfs_read(r3, G_PTR(r0), total_bytes);
+        return (uint32_t)(bytes_read / r1);
+    }
     if (is_stk_vfd(r3)) {
         int s = stk_slot(r3);
         FILE *sf = stk_ensure_open();
@@ -1431,12 +1744,21 @@ static uint32_t wrap_fread(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_
 }
 
 static uint32_t wrap_fwrite(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
+    if (is_mem_vfd(r3)) {
+        if (!r0 || r1 == 0 || r2 == 0) return 0;
+        size_t total_bytes = (size_t)r1 * (size_t)r2;
+        size_t bytes_written = mem_vfs_write(r3, G_PTR(r0), total_bytes);
+        return (uint32_t)(bytes_written / r1);
+    }
     /* STK is read-only; fall through to normal path (will be NULL) */
     FILE *f = get_fd(img, r3);
     return (f && r0) ? (uint32_t)fwrite(G_PTR(r0), r1, r2, f) : 0;
 }
 
 static uint32_t wrap_fseek(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
+    if (is_mem_vfd(r0)) {
+        return (uint32_t)mem_vfs_seek(r0, (int64_t)(int32_t)r1, (int)r2);
+    }
     if (is_stk_vfd(r0)) {
         int s = stk_slot(r0);
         FILE *sf = stk_ensure_open();
@@ -1473,6 +1795,9 @@ static uint32_t wrap_fseek(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_
 }
 
 static uint32_t wrap_ftell(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
+    if (is_mem_vfd(r0)) {
+        return (uint32_t)mem_vfs_tell(r0);
+    }
     if (is_stk_vfd(r0)) {
         int s = stk_slot(r0);
         return (g_stk_pos[s] >= 0) ? (uint32_t)g_stk_pos[s] : (uint32_t)-1;
@@ -1486,12 +1811,15 @@ static uint32_t wrap_ftell(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_
 }
 
 static uint32_t wrap_fflush(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
-    if (is_stk_vfd(r0)) return 0;
+    if (is_mem_vfd(r0) || is_stk_vfd(r0)) return 0;
     FILE *f = get_fd(img, r0);
     return f ? (uint32_t)fflush(f) : 0;
 }
 
 static uint32_t wrap_fgetc(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
+    if (is_mem_vfd(r0)) {
+        return (uint32_t)mem_vfs_getc(r0);
+    }
     if (is_stk_vfd(r0)) {
         int s = stk_slot(r0);
         FILE *sf = stk_ensure_open();
@@ -1509,11 +1837,17 @@ static uint32_t wrap_fgetc(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_
 }
 
 static uint32_t wrap_fputc(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
+    if (is_mem_vfd(r1)) {
+        return (uint32_t)mem_vfs_putc(r1, (int)r0);
+    }
     FILE *f = get_fd(img, r1);
     return f ? (uint32_t)fputc((int)r0, f) : (uint32_t)-1;
 }
 
 static uint32_t wrap_fgets(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
+    if (is_mem_vfd(r2)) {
+        return mem_vfs_gets(r2, (char*)G_PTR(r0), (int)r1) ? r0 : 0;
+    }
     FILE *f = get_fd(img, r2);
     if (f && r0) {
         char *res = fgets((char*)G_PTR(r0), (int)r1, f);
@@ -1523,6 +1857,9 @@ static uint32_t wrap_fgets(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_
 }
 
 static uint32_t wrap_fputs(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
+    if (is_mem_vfd(r1)) {
+        return (uint32_t)mem_vfs_puts(r1, (const char*)G_PTR(r0));
+    }
     FILE *f = get_fd(img, r1);
     const char *str = (const char*)G_PTR(r0);
     return (f && str) ? (uint32_t)fputs(str, f) : (uint32_t)-1;
@@ -1534,7 +1871,7 @@ static uint32_t wrap_ungetc(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32
 }
 
 static uint32_t wrap_ferror(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
-    if (is_stk_vfd(r0)) return 0;
+    if (is_mem_vfd(r0) || is_stk_vfd(r0)) return 0;
     FILE *f = get_fd(img, r0);
     return f ? (uint32_t)ferror(f) : 0;
 }
@@ -1550,6 +1887,32 @@ static uint32_t wrap_open(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t
     char path[PATH_MAX];
     sanitize_path(path, raw_path, sizeof(path));
 
+    int flags = r1 & 3;
+    const char *mode = "rb";
+    if (flags == 1) mode = "wb";
+    else if (flags == 2) mode = "r+b";
+    if (r1 & 0x200) mode = "wb";
+
+    /* --- Android .nomedia exclusion file: redirect to null device --- */
+    if (is_nomedia_path(path, raw_path)) {
+        FILE *nf = open_null_device(mode);
+        if (nf) {
+            uint32_t fd = alloc_fd(nf);
+            if (fd) return fd;
+            fclose(nf);
+        }
+        return (uint32_t)-1;
+    }
+
+    /* --- Virtual In-Memory Temporary Files (~temp*.xkv) --- */
+    if (is_temp_vfs_path(path, raw_path)) {
+        uint32_t vfd = mem_vfs_open(path, mode);
+        if (!vfd && raw_path && strcmp(path, raw_path) != 0) {
+            vfd = mem_vfs_open(raw_path, mode);
+        }
+        return vfd ? vfd : (uint32_t)-1;
+    }
+
     /* Also intercept STK opens via POSIX open() */
     if (path_is_stk(path) || path_is_stk(raw_path)) {
         if (!g_stk_file) {
@@ -1561,11 +1924,6 @@ static uint32_t wrap_open(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t
         return vfd ? vfd : (uint32_t)-1;
     }
 
-    int flags = r1 & 3;
-    const char *mode = "rb";
-    if (flags == 1) mode = "wb";
-    else if (flags == 2) mode = "r+b";
-    if (r1 & 0x200) mode = "wb";
     FILE *f = fopen_loose_override(path, raw_path, mode);
     if (f) {
         uint32_t fd = alloc_fd(f);
@@ -1583,6 +1941,10 @@ static uint32_t wrap_close(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_
 }
 
 static uint32_t wrap_read(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
+    if (is_mem_vfd(r0)) {
+        if (!r1) return (uint32_t)-1;
+        return (uint32_t)mem_vfs_read(r0, G_PTR(r1), r2);
+    }
     if (is_stk_vfd(r0)) {
         int s = stk_slot(r0);
         if (!r1 || !g_stk_file || stk_seek_to(s) < 0) return (uint32_t)-1;
@@ -1600,12 +1962,22 @@ static uint32_t wrap_read(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t
 }
 
 static uint32_t wrap_write(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
+    if (is_mem_vfd(r0)) {
+        if (!r1) return (uint32_t)-1;
+        return (uint32_t)mem_vfs_write(r0, G_PTR(r1), r2);
+    }
     FILE *f = get_fd(img, r0);
     if (f && r1) return (uint32_t)fwrite(G_PTR(r1), 1, r2, f);
     return (uint32_t)-1;
 }
 
 static uint32_t wrap_lseek(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
+    if (is_mem_vfd(r0)) {
+        if (mem_vfs_seek(r0, (int64_t)(int32_t)r1, (int)r2) == 0) {
+            return (uint32_t)mem_vfs_tell(r0);
+        }
+        return (uint32_t)-1;
+    }
     if (is_stk_vfd(r0)) {
         /* Reuse fseek logic then return new position */
         wrap_fseek(img, r0, r1, r2, r3, sp);
@@ -1631,6 +2003,18 @@ static uint32_t wrap_stat(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t
     const char *raw_path = (const char*)G_PTR(r0);
     char path[PATH_MAX];
     sanitize_path(path, raw_path, sizeof(path));
+
+    if (is_nomedia_path(path, raw_path)) {
+        return (uint32_t)-1;
+    }
+    if (is_temp_vfs_path(path, raw_path)) {
+        size_t fsize = 0;
+        if (mem_vfs_stat_path(path, &fsize) || mem_vfs_stat_path(raw_path, &fsize)) {
+            fill_stat32(G_PTR(r1), (int64_t)fsize, 0100666);
+            return 0;
+        }
+    }
+
     struct __stat64 st;
     if (_stat64(path, &st) == 0 || _stat64(raw_path, &st) == 0) {
         fill_stat32(G_PTR(r1), st.st_size, (uint32_t)st.st_mode);
@@ -1657,6 +2041,11 @@ static uint32_t wrap_stat(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t
 
 static uint32_t wrap_fstat(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
     if (!r1) return (uint32_t)-1;
+    if (is_mem_vfd(r0)) {
+        size_t fsize = mem_vfs_size(r0);
+        fill_stat32(G_PTR(r1), (int64_t)fsize, 0100666);
+        return 0;
+    }
     if (is_stk_vfd(r0)) {
         FILE *sf = stk_ensure_open();
         if (sf) {
@@ -1686,6 +2075,17 @@ static uint32_t wrap_access(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32
     const char *raw_path = (const char*)G_PTR(r0);
     char path[PATH_MAX];
     sanitize_path(path, raw_path, sizeof(path));
+
+    if (is_nomedia_path(path, raw_path)) {
+        return (uint32_t)-1;
+    }
+    if (is_temp_vfs_path(path, raw_path)) {
+        size_t fsize = 0;
+        if (mem_vfs_stat_path(path, &fsize) || mem_vfs_stat_path(raw_path, &fsize)) {
+            return 0;
+        }
+    }
+
     int res = _access(path, r1);
     if (res != 0) {
         res = _access(raw_path, r1);
@@ -1703,8 +2103,18 @@ static uint32_t wrap_access(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32
 
 static uint32_t wrap_unlink(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
     if (!r0) return (uint32_t)-1;
+    const char *raw_path = (const char*)G_PTR(r0);
     char path[PATH_MAX];
-    sanitize_path(path, (const char*)G_PTR(r0), sizeof(path));
+    sanitize_path(path, raw_path, sizeof(path));
+
+    if (is_nomedia_path(path, raw_path)) {
+        return 0;
+    }
+    if (is_temp_vfs_path(path, raw_path)) {
+        mem_vfs_delete(path);
+        mem_vfs_delete(raw_path);
+        return 0;
+    }
     return remove(path);
 }
 

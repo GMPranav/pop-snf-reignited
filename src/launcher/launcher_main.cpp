@@ -82,6 +82,9 @@ static bool s_rebinding_is_sec = false;
 static uint32_t s_rebinding_start_ticks = 0;
 
 // Dolphin-style Escape Handling & Rebind Timing
+// True while the Controls tab was shown last frame (undo/redo only tracks key binds)
+static bool s_on_controls_tab = false;
+static bool s_on_controls_tab_next = false;
 static bool s_escape_held = false;
 static uint32_t s_escape_hold_start = 0;
 static uint32_t s_last_escape_tap = 0;
@@ -251,6 +254,11 @@ static GLuint load_gl_texture_from_mem(const unsigned char *data_buf, size_t dat
 }
 
 static GLuint load_gl_texture(const char *filename) {
+    // Official Reignited branding logo is always sourced from embedded assets
+    if (strstr(filename, "logo")) {
+        return load_gl_texture_from_mem(s_embedded_logo_png, s_embedded_logo_png_len);
+    }
+
     std::string path = find_asset_file(filename);
     if (!path.empty()) {
         int w, h, comp;
@@ -314,7 +322,7 @@ static std::string open_apk_dialog() {
     ofn.lpstrFile = filename;
     ofn.nMaxFile = MAX_PATH;
     ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
-    ofn.lpstrTitle = "Select Prince of Persia: The Shadow and the Flame APK";
+    ofn.lpstrTitle = "Select Prince of Persia: Shadow and the Flame APK";
     if (GetOpenFileNameA(&ofn)) {
         if (!s_app_dir.empty()) SetCurrentDirectoryA(s_app_dir.c_str());
         return std::string(filename);
@@ -325,7 +333,10 @@ static std::string open_apk_dialog() {
 
 static void start_extraction(const std::string &apk_path) {
     s_extract_progress = 0.01f;
-    s_extract_status = "Starting extraction...";
+    {
+        std::lock_guard<std::mutex> lock(s_extract_mutex);
+        s_extract_status = "Starting extraction...";
+    }
     s_extract_done = false;
     s_extract_success = false;
     s_view = VIEW_EXTRACTING;
@@ -352,13 +363,19 @@ static void ensure_compatibility_flags(const std::string &exe_path) {
     if (RegCreateKeyExA(HKEY_CURRENT_USER, 
                         "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers",
                         0, NULL, 0, KEY_SET_VALUE | KEY_QUERY_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-        char current_val[256] = {0};
-        DWORD val_size = sizeof(current_val);
+        char current_val[400] = {0};
+        DWORD val_size = sizeof(current_val) - 1;
         DWORD type = 0;
         LONG res = RegQueryValueExA(hKey, exe_path.c_str(), NULL, &type, (LPBYTE)current_val, &val_size);
-        const char *val = "~ DISABLEDXMAXIMIZEDWINDOWEDMODE";
         if (res != ERROR_SUCCESS || strstr(current_val, "DISABLEDXMAXIMIZEDWINDOWEDMODE") == NULL) {
-            RegSetValueExA(hKey, exe_path.c_str(), 0, REG_SZ, (const BYTE*)val, (DWORD)strlen(val) + 1);
+            // Append to any existing flags instead of clobbering them
+            char new_val[512] = {0};
+            if (res == ERROR_SUCCESS && current_val[0] != '\0') {
+                snprintf(new_val, sizeof(new_val), "%s DISABLEDXMAXIMIZEDWINDOWEDMODE", current_val);
+            } else {
+                snprintf(new_val, sizeof(new_val), "~ DISABLEDXMAXIMIZEDWINDOWEDMODE");
+            }
+            RegSetValueExA(hKey, exe_path.c_str(), 0, REG_SZ, (const BYTE*)new_val, (DWORD)strlen(new_val) + 1);
         }
         RegCloseKey(hKey);
     }
@@ -384,6 +401,14 @@ static void apply_windows_gpu_preference(const std::string &exe_path, int pref) 
 
 static bool s_launcher_debug = false;
 
+static std::string get_game_exe_path() {
+    return s_app_dir + "\\PoPSnF_Reignited.exe";
+}
+
+static std::string get_game_exe_name() {
+    return "PoPSnF_Reignited.exe";
+}
+
 static void launch_game() {
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
@@ -391,7 +416,7 @@ static void launch_game() {
     memset(&pi, 0, sizeof(pi));
     si.cb = sizeof(si);
 
-    std::string full_exe = s_app_dir + "\\PoPSnF_PC.exe";
+    std::string full_exe = get_game_exe_path();
 #ifdef _WIN32
     ensure_compatibility_flags(full_exe);
     apply_windows_gpu_preference(full_exe, g_config.gpu_preference);
@@ -408,16 +433,20 @@ static void launch_game() {
         CloseHandle(pi.hThread);
         exit(0);
     } else {
-        char fallback_cmd[64] = "PoPSnF_PC.exe";
+        std::string exe_name = get_game_exe_name();
+        std::string fallback_cmd = exe_name;
         if (s_launcher_debug) {
-            strcat(fallback_cmd, " --debug");
+            fallback_cmd += " --debug";
         }
-        if (CreateProcessA(NULL, fallback_cmd, NULL, NULL, FALSE, 0, NULL, s_app_dir.c_str(), &si, &pi)) {
+        std::vector<char> fallback_buf(fallback_cmd.begin(), fallback_cmd.end());
+        fallback_buf.push_back('\0');
+        if (CreateProcessA(NULL, fallback_buf.data(), NULL, NULL, FALSE, 0, NULL, s_app_dir.c_str(), &si, &pi)) {
             CloseHandle(pi.hProcess);
             CloseHandle(pi.hThread);
             exit(0);
         }
-        MessageBoxA(NULL, "Failed to start PoPSnF_PC.exe. Make sure it exists in this directory.", "Launch Error", MB_ICONERROR);
+        std::string err_msg = "Failed to start " + exe_name + ". Make sure it exists in this directory.";
+        MessageBoxA(NULL, err_msg.c_str(), "Launch Error", MB_ICONERROR);
     }
 }
 
@@ -688,7 +717,7 @@ int main(int argc, char *argv[]) {
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
     SDL_Window *window = SDL_CreateWindow(
-        "Prince of Persia: The Shadow and the Flame - Launcher & Configurator",
+        "Prince of Persia: Shadow and the Flame - Reignited - Launcher & Configurator",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         WIN_W, WIN_H,
         SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN
@@ -762,7 +791,9 @@ int main(int argc, char *argv[]) {
                     SDL_Keymod mod = SDL_GetModState();
                     bool ctrl = (mod & KMOD_CTRL) != 0;
                     bool shift = (mod & KMOD_SHIFT) != 0;
-                    if (ctrl && !shift && sc == SDL_SCANCODE_Z) {
+                    if (!s_on_controls_tab || s_view != VIEW_SETTINGS) {
+                        // Undo history only covers key binds; ignore elsewhere
+                    } else if (ctrl && !shift && sc == SDL_SCANCODE_Z) {
                         perform_undo(temp_cfg);
                     } else if ((ctrl && sc == SDL_SCANCODE_Y) || (ctrl && shift && sc == SDL_SCANCODE_Z)) {
                         perform_redo(temp_cfg);
@@ -1016,14 +1047,16 @@ int main(int argc, char *argv[]) {
                 g_config = temp_cfg;
                 g_config.save("config.ini");
 #ifdef _WIN32
-                std::string full_exe = s_app_dir + "\\PoPSnF_PC.exe";
+                std::string full_exe = get_game_exe_path();
                 ensure_compatibility_flags(full_exe);
                 apply_windows_gpu_preference(full_exe, g_config.gpu_preference);
 #endif
+                cancel_rebinding();
                 s_view = VIEW_MAIN;
             }
             ImGui::SetCursorPos(ImVec2(710, 140));
             if (ImGui::Button("Cancel", ImVec2(115, 34))) {
+                cancel_rebinding();
                 s_view = VIEW_MAIN;
             }
 
@@ -1210,6 +1243,7 @@ int main(int argc, char *argv[]) {
                 ImGuiTabItemFlags ctrl_flags = (s_settings_tab == 1) ? ImGuiTabItemFlags_SetSelected : 0;
                 if (ImGui::BeginTabItem("Controls Options", nullptr, ctrl_flags)) {
                     s_settings_tab = -1;
+                    s_on_controls_tab_next = true;
                     ImGui::Spacing();
                     ImGui::BeginChild("ControlsChild", ImVec2(660, 420), true);
 
@@ -1458,13 +1492,13 @@ int main(int argc, char *argv[]) {
 
                     ImGui::Spacing();
 
-                    ImGui::Checkbox("Clean Touch Controls (Hide Potion & Stealth Walk buttons)", &temp_cfg.mod_clean_touch_hud);
+                    ImGui::Checkbox("Clean Touch Controls (Hide on-screen touch buttons)", &temp_cfg.mod_clean_touch_hud);
                     if (ImGui::IsItemHovered()) {
-                        ImGui::SetTooltip("Removes floating on-screen mobile touch buttons for Potion, Stealth Walk, and Combat Block during gameplay for an uncluttered PC display. Keyboard and gamepad controls remain fully functional.");
+                        ImGui::SetTooltip("Removes all floating on-screen mobile touch controls during gameplay for an uncluttered PC display. Keyboard and gamepad controls remain fully functional.");
                     }
                     ImGui::Spacing();
                     ImGui::Indent(28.0f);
-                    ImGui::TextDisabled("Hides on-screen touch buttons for Potion and Stealth Walk during gameplay.");
+                    ImGui::TextDisabled("Hides all on-screen touch buttons (joystick, action, potion, stealth walk) during gameplay.");
                     ImGui::Unindent(28.0f);
 
                     ImGui::Spacing();
@@ -1576,6 +1610,9 @@ int main(int argc, char *argv[]) {
             save_gl_screenshot(screenshot_path, WIN_W, WIN_H);
             running = false;
         }
+
+        s_on_controls_tab = s_on_controls_tab_next;
+        s_on_controls_tab_next = false;
 
         SDL_Delay(16);
     }

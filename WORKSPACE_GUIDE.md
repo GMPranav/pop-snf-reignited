@@ -27,7 +27,7 @@ The runtime folder is designed around a **clean, pristine STK-only architecture*
 | Item | Type | Description |
 | :--- | :--- | :--- |
 | `game/PoPSnF_Launcher.exe` | Binary | Nostalgic PoP 2008-styled Launcher, Configurator & APK Extractor. |
-| `game/PoPSnF_PC.exe` | Binary | Compiled native Windows x64 game engine executable. |
+| `game/PoPSnF_Reignited.exe` | Binary | Compiled native Windows x64 game engine executable. |
 | `game/SDL2.dll` | Library | 64-bit SDL2 runtime library. |
 | `game/OpenAL32.dll` | Library | 64-bit OpenAL Soft runtime library. |
 | `game/libS3DClient.so` | Shared Library | Original ARMv7 engine binary extracted from mobile release. |
@@ -86,7 +86,7 @@ Contains framebuffer captures generated during automated regression tests (`--he
 | `src/bridge/bridge_openal.c`| 3D positional audio translation layer mapping sound calls to OpenAL Soft. |
 | `src/bridge/bridge_jni.c` | Android JavaVM and JNIEnv simulation layer (160+ function slots). |
 | `src/bridge/hud_back_btn_dxt5.h` | DXT5 texture data for the red curved menu back button. |
-| `CMakeLists.txt` | Master build script: compiles `PoPSnF_PC.exe` and `PoPSnF_Launcher.exe`, and auto-deploys to `game/`. |
+| `CMakeLists.txt` | Master build script: compiles `PoPSnF_Reignited.exe` and `PoPSnF_Launcher.exe`, and auto-deploys to `game/`. |
 | `third_party/imgui/` | Dear ImGui library and SDL2/OpenGL2 backends. |
 | `third_party/miniz/` | Lightweight single-file ZIP extraction library used by the asset extractor. |
 | `third_party/lzma/` | LZMA decompression library. |
@@ -110,12 +110,12 @@ $env:PATH = "$PWD\tools\w64devkit\bin;$PWD\tools\cmake\bin;" + $env:PATH
 ```
 
 ### Compiling
-Configure and build both targets (`PoPSnF_PC` and `PoPSnF_Launcher`):
+Configure and build both targets (`PoPSnF_Reignited` and `PoPSnF_Launcher`):
 ```powershell
 cmake -B build_app -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build_app
 ```
-CMake compiles modified files in `src/`, links against prebuilt dependencies, and automatically deploys `PoPSnF_PC.exe`, `PoPSnF_Launcher.exe`, `SDL2.dll`, and `OpenAL32.dll` to `game/`.
+CMake compiles modified files in `src/`, links against prebuilt dependencies, and automatically deploys `PoPSnF_Reignited.exe`, `PoPSnF_Launcher.exe`, `SDL2.dll`, and `OpenAL32.dll` to `game/`.
 
 ---
 
@@ -134,12 +134,12 @@ From the Launcher, you can:
   - **Mouse Scroll Wheel**: Map `Wheel Up`, `Wheel Down`, `Wheel Left`, or `Wheel Right` to any action.
   - **Dolphin-Style Escape Binding**: Hold `Escape` for 750ms or double-tap to bind Escape; quick tap cancels.
   - **Undo / Redo History**: Undo (`Ctrl+Z`) and Redo (`Ctrl+Y`) for remapping changes or accidental default resets.
-- **Launch the Game**: Launches `PoPSnF_PC.exe` with your configured settings.
+- **Launch the Game**: Launches `PoPSnF_Reignited.exe` with your configured settings.
 
 ### Method 2: Direct Game Play (CLI)
-Launch `PoPSnF_PC.exe` directly:
+Launch `PoPSnF_Reignited.exe` directly:
 ```powershell
-.\game\PoPSnF_PC.exe
+.\game\PoPSnF_Reignited.exe
 ```
 
 ### Method 3: Headless Automated Regression Testing
@@ -147,11 +147,11 @@ Pass diagnostic arguments to verify menus or gameplay without manual input:
 
 | Command | Action |
 | :--- | :--- |
-| `.\game\PoPSnF_PC.exe --headless --frames 120` | Headless sanity check (120 frames). |
-| `.\game\PoPSnF_PC.exe --headless --menu coins --frames 250` | Enters Coin Store and captures frames 160-250. |
-| `.\game\PoPSnF_PC.exe --headless --menu world_map --frames 250` | Enters World Map menu and captures screenshots. |
-| `.\game\PoPSnF_PC.exe --headless --menu new_game --frames 1750` | Plays intro cutscenes and enters Level 1 courtyard. |
-| `.\game\PoPSnF_PC.exe --headless --action level1_play --frames 1200` | Enters Level 1 and verifies gameplay controls. |
+| `.\game\PoPSnF_Reignited.exe --headless --frames 120` | Headless sanity check (120 frames). |
+| `.\game\PoPSnF_Reignited.exe --headless --menu coins --frames 250` | Enters Coin Store and captures frames 160-250. |
+| `.\game\PoPSnF_Reignited.exe --headless --menu world_map --frames 250` | Enters World Map menu and captures screenshots. |
+| `.\game\PoPSnF_Reignited.exe --headless --menu new_game --frames 1750` | Plays intro cutscenes and enters Level 1 courtyard. |
+| `.\game\PoPSnF_Reignited.exe --headless --action level1_play --frames 1200` | Enters Level 1 and verifies gameplay controls. |
 
 ### Method 4: Launcher Command-Line Interface
 | Command | Action |

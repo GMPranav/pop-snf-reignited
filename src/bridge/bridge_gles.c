@@ -81,11 +81,14 @@ static uint32_t g_draw_arrays_calls = 0;
 static uint32_t g_draw_elements_calls = 0;
 static uint32_t g_clear_calls = 0;
 static uint32_t g_bound_fbo = 0;
+
 static uint32_t g_tex_compressed_calls = 0;
 GL_FN(void, glPixelStorei, (GLenum pname, GLint param))
 GL_FN(void, glPolygonOffset, (GLfloat factor, GLfloat units))
 GL_FN(void, glReadPixels, (GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void *pixels))
 GL_FN(void, glRenderbufferStorage, (GLenum target, GLenum internalformat, GLsizei width, GLsizei height))
+GL_FN(void, glRenderbufferStorageMultisample, (GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height))
+GL_FN(void, glBlitFramebuffer, (GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter))
 GL_FN(void, glScissor, (GLint x, GLint y, GLsizei width, GLsizei height))
 GL_FN(void, glShaderSource, (GLuint shader, GLsizei count, const GLchar *const*string, const GLint *length))
 GL_FN(void, glStencilFunc, (GLenum func, GLint ref, GLuint mask))
@@ -171,6 +174,8 @@ int bridge_gles_init(void) {
     LOAD_PROC(glPolygonOffset)
     LOAD_PROC(glReadPixels)
     LOAD_PROC(glRenderbufferStorage)
+    LOAD_PROC(glRenderbufferStorageMultisample)
+    LOAD_PROC(glBlitFramebuffer)
     LOAD_PROC(glScissor)
     LOAD_PROC(glShaderSource)
     LOAD_PROC(glStencilFunc)
@@ -198,6 +203,110 @@ int bridge_gles_init(void) {
     return 1;
 }
 
+/* Offscreen (multisampled) default framebuffer.
+ * Some drivers (Optimus/hybrid dGPUs) hand out a window framebuffer with no MSAA and an ignored swap
+ * interval. When enabled, the guest's "framebuffer 0" is redirected to an FBO at render resolution and
+ * bridge_gles_present() resolves/scales it to the window in one short blit right before the swap. */
+#define GL_FRAMEBUFFER_ 0x8D40
+#define GL_READ_FRAMEBUFFER_ 0x8CA8
+#define GL_DRAW_FRAMEBUFFER_ 0x8CA9
+#define GL_RENDERBUFFER_ 0x8D41
+#define GL_COLOR_ATTACHMENT0_ 0x8CE0
+#define GL_DEPTH_STENCIL_ATTACHMENT_ 0x821A
+#define GL_DEPTH24_STENCIL8_ 0x88F0
+#define GL_RGBA8_ 0x8058
+#define GL_MAX_SAMPLES_ 0x8D57
+#define GL_FRAMEBUFFER_COMPLETE_ 0x8CD5
+static struct {
+    int      active;
+    int      samples;
+    int      w, h;
+    GLuint   main_fbo, main_color_rb, main_depth_rb;   /* what the guest renders into */
+    GLuint   resolve_fbo, resolve_color_rb;            /* single-sample copy used for scaling/readback */
+} s_off;
+
+/* Framebuffer that holds the finished (single-sample) image */
+static GLuint off_display_fbo(void) {
+    return (s_off.samples > 0) ? s_off.resolve_fbo : s_off.main_fbo;
+}
+
+/* Resolve the multisampled frame into the single-sample FBO; leaves the guest's framebuffer bound */
+static void off_resolve(void) {
+    if (!s_off.active || s_off.samples <= 0 || !pfn_glBlitFramebuffer) return;
+    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+    if (scissor) glDisable(GL_SCISSOR_TEST);
+    pfn_glBindFramebuffer(GL_READ_FRAMEBUFFER_, s_off.main_fbo);
+    pfn_glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, s_off.resolve_fbo);
+    pfn_glBlitFramebuffer(0, 0, s_off.w, s_off.h, 0, 0, s_off.w, s_off.h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    pfn_glBindFramebuffer(GL_FRAMEBUFFER_, g_bound_fbo ? g_bound_fbo : s_off.main_fbo);
+    if (scissor) glEnable(GL_SCISSOR_TEST);
+}
+
+static void off_destroy(void) {
+    if (pfn_glBindFramebuffer) pfn_glBindFramebuffer(GL_FRAMEBUFFER_, 0);
+    if (s_off.main_fbo && pfn_glDeleteFramebuffers) pfn_glDeleteFramebuffers(1, &s_off.main_fbo);
+    if (s_off.resolve_fbo && pfn_glDeleteFramebuffers) pfn_glDeleteFramebuffers(1, &s_off.resolve_fbo);
+    if (s_off.main_color_rb && pfn_glDeleteRenderbuffers) pfn_glDeleteRenderbuffers(1, &s_off.main_color_rb);
+    if (s_off.main_depth_rb && pfn_glDeleteRenderbuffers) pfn_glDeleteRenderbuffers(1, &s_off.main_depth_rb);
+    if (s_off.resolve_color_rb && pfn_glDeleteRenderbuffers) pfn_glDeleteRenderbuffers(1, &s_off.resolve_color_rb);
+    memset(&s_off, 0, sizeof(s_off));
+}
+
+/* Creates the offscreen framebuffers and redirects framebuffer 0 to them. Returns the sample count in use
+ * (0 = no MSAA) or -1 if the offscreen path could not be set up (the window framebuffer is then used as-is). */
+int bridge_gles_offscreen_init(int w, int h, int samples) {
+    if (!pfn_glGenFramebuffers || !pfn_glGenRenderbuffers || !pfn_glBindRenderbuffer || !pfn_glFramebufferRenderbuffer ||
+        !pfn_glCheckFramebufferStatus || !pfn_glBlitFramebuffer || !pfn_glBindFramebuffer) {
+        return -1;
+    }
+    GLint max_samples = 0;
+    if (pfn_glGetIntegerv) pfn_glGetIntegerv(GL_MAX_SAMPLES_, &max_samples);
+    if (samples > max_samples) samples = max_samples;
+    if (samples < 2 || !pfn_glRenderbufferStorageMultisample) samples = 0;
+
+    for (;;) {
+        memset(&s_off, 0, sizeof(s_off));
+        s_off.w = w; s_off.h = h; s_off.samples = samples;
+
+        pfn_glGenFramebuffers(1, &s_off.main_fbo);
+        pfn_glGenRenderbuffers(1, &s_off.main_color_rb);
+        pfn_glGenRenderbuffers(1, &s_off.main_depth_rb);
+        pfn_glBindRenderbuffer(GL_RENDERBUFFER_, s_off.main_color_rb);
+        if (samples > 0) pfn_glRenderbufferStorageMultisample(GL_RENDERBUFFER_, samples, GL_RGBA8_, w, h);
+        else             pfn_glRenderbufferStorage(GL_RENDERBUFFER_, GL_RGBA8_, w, h);
+        pfn_glBindRenderbuffer(GL_RENDERBUFFER_, s_off.main_depth_rb);
+        if (samples > 0) pfn_glRenderbufferStorageMultisample(GL_RENDERBUFFER_, samples, GL_DEPTH24_STENCIL8_, w, h);
+        else             pfn_glRenderbufferStorage(GL_RENDERBUFFER_, GL_DEPTH24_STENCIL8_, w, h);
+        pfn_glBindFramebuffer(GL_FRAMEBUFFER_, s_off.main_fbo);
+        pfn_glFramebufferRenderbuffer(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_RENDERBUFFER_, s_off.main_color_rb);
+        pfn_glFramebufferRenderbuffer(GL_FRAMEBUFFER_, GL_DEPTH_STENCIL_ATTACHMENT_, GL_RENDERBUFFER_, s_off.main_depth_rb);
+        int ok = (pfn_glCheckFramebufferStatus(GL_FRAMEBUFFER_) == GL_FRAMEBUFFER_COMPLETE_);
+
+        if (ok && samples > 0) {
+            pfn_glGenFramebuffers(1, &s_off.resolve_fbo);
+            pfn_glGenRenderbuffers(1, &s_off.resolve_color_rb);
+            pfn_glBindRenderbuffer(GL_RENDERBUFFER_, s_off.resolve_color_rb);
+            pfn_glRenderbufferStorage(GL_RENDERBUFFER_, GL_RGBA8_, w, h);
+            pfn_glBindFramebuffer(GL_FRAMEBUFFER_, s_off.resolve_fbo);
+            pfn_glFramebufferRenderbuffer(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_RENDERBUFFER_, s_off.resolve_color_rb);
+            ok = (pfn_glCheckFramebufferStatus(GL_FRAMEBUFFER_) == GL_FRAMEBUFFER_COMPLETE_);
+        }
+        if (ok) break;
+
+        off_destroy();
+        if (samples == 0) return -1;
+        samples = (samples > 2) ? samples / 2 : 0;   /* step down 8 -> 4 -> 2 -> off */
+    }
+
+    s_off.active = 1;
+    pfn_glBindFramebuffer(GL_FRAMEBUFFER_, s_off.main_fbo);
+    return s_off.samples;
+}
+
+int bridge_gles_offscreen_active(void) {
+    return s_off.active;
+}
+
 #define G_PTR(addr) ((addr) ? (img->mem + (addr)) : NULL)
 #define READ_STACK(idx) (*(uint32_t*)(img->mem + sp + (idx) * 4))
 
@@ -219,7 +328,7 @@ static uint32_t wrap_glBindBuffer(elf32_image_t *img, uint32_t r0, uint32_t r1, 
 }
 static uint32_t wrap_glBindFramebuffer(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
     g_bound_fbo = r1;
-    if (pfn_glBindFramebuffer) pfn_glBindFramebuffer(r0, r1);
+    if (pfn_glBindFramebuffer) pfn_glBindFramebuffer(r0, (r1 == 0 && s_off.active) ? s_off.main_fbo : r1);
     return 0;
 }
 static uint32_t wrap_glBindRenderbuffer(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
@@ -611,6 +720,10 @@ static uint32_t wrap_glGenTextures(elf32_image_t *img, uint32_t r0, uint32_t r1,
 }
 static uint32_t wrap_glGetIntegerv(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
     if (pfn_glGetIntegerv) pfn_glGetIntegerv(r0, (GLint*)G_PTR(r1));
+    if (s_off.active && (r0 == 0x8CA6 || r0 == 0x8CAA /* draw/read framebuffer binding */) && r1) {
+        GLint *out = (GLint*)G_PTR(r1);
+        if ((GLuint)*out == s_off.main_fbo) *out = 0;   /* the guest must keep seeing the window as framebuffer 0 */
+    }
     return 0;
 }
 static uint32_t wrap_glGetProgramInfoLog(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
@@ -719,6 +832,14 @@ static uint32_t wrap_glReadPixels(elf32_image_t *img, uint32_t r0, uint32_t r1, 
     GLenum fmt = READ_STACK(0);
     GLenum type = READ_STACK(1);
     void *pixels = G_PTR(READ_STACK(2));
+    if (s_off.active && g_bound_fbo == 0) {
+        /* Reading the "window" while it is redirected to the offscreen FBO: read the resolved copy */
+        off_resolve();
+        pfn_glBindFramebuffer(GL_READ_FRAMEBUFFER_, off_display_fbo());
+        if (pfn_glReadPixels) pfn_glReadPixels(r0, r1, w, h, fmt, type, pixels);
+        pfn_glBindFramebuffer(GL_READ_FRAMEBUFFER_, s_off.main_fbo);
+        return 0;
+    }
     if (pfn_glReadPixels) pfn_glReadPixels(r0, r1, w, h, fmt, type, pixels);
     return 0;
 }
@@ -780,13 +901,41 @@ void bridge_gles_render_letterbox_bars(int window_w, int window_h) {
     glDisable(GL_SCISSOR_TEST);
 }
 
+/* Copies the finished offscreen frame to the window (scaled / letterboxed). Call right before the swap. */
+void bridge_gles_present(int window_w, int window_h) {
+    if (!s_off.active) return;
+    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+    if (scissor) glDisable(GL_SCISSOR_TEST);
+
+    off_resolve();
+
+    int dx = s_dst_x, dy = s_dst_y, dw = s_dst_w, dh = s_dst_h;
+    if (!s_scale_enabled) { dx = 0; dy = 0; dw = window_w; dh = window_h; }
+
+    pfn_glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, 0);
+    if (dx > 0 || dy > 0 || dw < window_w || dh < window_h) {
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);   /* letterbox / pillarbox bars */
+    }
+    pfn_glBindFramebuffer(GL_READ_FRAMEBUFFER_, off_display_fbo());
+    pfn_glBlitFramebuffer(0, 0, s_off.w, s_off.h, dx, dy, dx + dw, dy + dh, GL_COLOR_BUFFER_BIT,
+                          (dw == s_off.w && dh == s_off.h) ? GL_NEAREST : GL_LINEAR);
+    if (scissor) glEnable(GL_SCISSOR_TEST);
+}
+
+/* Re-binds the guest's framebuffer after the swap */
+void bridge_gles_begin_frame(void) {
+    if (!s_off.active) return;
+    pfn_glBindFramebuffer(GL_FRAMEBUFFER_, g_bound_fbo ? g_bound_fbo : s_off.main_fbo);
+}
+
 static uint32_t wrap_glScissor(elf32_image_t *img, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t sp) {
     GLint x = (GLint)r0;
     GLint y = (GLint)r1;
     GLsizei w = (GLsizei)r2;
     GLsizei h = (GLsizei)r3;
 
-    if (g_bound_fbo == 0 && s_scale_enabled) {
+    if (g_bound_fbo == 0 && s_scale_enabled && !s_off.active) {
         if (w > 0 && h > 0) {
             x = s_dst_x + (GLint)(x * s_scale_x + 0.5f);
             y = s_dst_y + (GLint)(y * s_scale_y + 0.5f);
@@ -995,7 +1144,7 @@ static uint32_t wrap_glViewport(elf32_image_t *img, uint32_t r0, uint32_t r1, ui
     GLsizei w = (GLsizei)r2;
     GLsizei h = (GLsizei)r3;
 
-    if (g_bound_fbo == 0 && s_scale_enabled) {
+    if (g_bound_fbo == 0 && s_scale_enabled && !s_off.active) {
         if (w > 0 && h > 0) {
             x = s_dst_x + (GLint)(x * s_scale_x + 0.5f);
             y = s_dst_y + (GLint)(y * s_scale_y + 0.5f);
@@ -1008,7 +1157,7 @@ static uint32_t wrap_glViewport(elf32_image_t *img, uint32_t r0, uint32_t r1, ui
         static int s_vp_logged = 0;
         if (s_vp_logged++ < 10) {
             printf("[GL] glViewport(x=%d, y=%d, w=%d, h=%d)%s\n",
-                   x, y, w, h, (g_bound_fbo == 0 && s_scale_enabled) ? " [SCALED]" : "");
+                   x, y, w, h, (g_bound_fbo == 0 && s_scale_enabled && !s_off.active) ? " [SCALED]" : "");
         }
     }
     if (pfn_glViewport) pfn_glViewport(x, y, w, h);
@@ -1126,6 +1275,14 @@ uint32_t bridge_gles_get_bound_fbo(void) {
 }
 
 void bridge_gles_save_screenshot(const char *filename, int w, int h) {
+    int off_screenshot = s_off.active && g_bound_fbo == 0;
+    if (off_screenshot) {
+        /* Capture the offscreen frame at render resolution */
+        w = s_off.w;
+        h = s_off.h;
+        off_resolve();
+        pfn_glBindFramebuffer(GL_READ_FRAMEBUFFER_, off_display_fbo());
+    }
     if (!pfn_glReadPixels) {
         printf("[-] Screenshot failed: glReadPixels not loaded\n");
         return;
@@ -1138,6 +1295,8 @@ void bridge_gles_save_screenshot(const char *filename, int w, int h) {
 
     if (pfn_glPixelStorei) pfn_glPixelStorei(0x0D05 /* GL_PACK_ALIGNMENT */, 1);
     pfn_glReadPixels(0, 0, w, h, 0x1908 /* GL_RGBA */, 0x1401 /* GL_UNSIGNED_BYTE */, rgba);
+
+    if (off_screenshot) pfn_glBindFramebuffer(GL_READ_FRAMEBUFFER_, s_off.main_fbo);
 
     GLenum err = pfn_glGetError ? pfn_glGetError() : 0;
     if (err != 0) {

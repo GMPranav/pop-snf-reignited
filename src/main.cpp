@@ -34,6 +34,7 @@ bool g_debug_mode = false;
 extern "C" {
     __declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000000;
     __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 0;
+    __declspec(dllexport) uint8_t *g_guest_memory_base = nullptr;
 }
 
 #include <dwmapi.h>
@@ -44,6 +45,15 @@ static PFN_DwmGetCompositionTimingInfo s_pfn_DwmGetCompositionTimingInfo = nullp
 static bool s_dwm_queried = false;
 static int s_swap_control = 0;
 static bool s_dwm_composition_enforced = false;
+#else
+static int s_swap_control = 0;
+#endif
+
+/* How frames are paced: see "Resolve how presentation is paced" in main(). */
+enum VsyncMode { VSYNC_OFF = 0, VSYNC_DRIVER, VSYNC_DWM, VSYNC_SOFTWARE };
+static VsyncMode s_vsync_mode = VSYNC_OFF;
+static bool s_offscreen = false;   /* guest renders into an offscreen FBO that is blitted to the window */
+#ifdef _WIN32
 
 static void ensure_compatibility_flags(void) {
     char exe_path[MAX_PATH];
@@ -296,15 +306,18 @@ static void show_startup_splash(SDL_Window *window) {
  *                heap_delta=+4MB  (asset load spike?)
  * ========================================================================= */
 #define PERF_WINDOW   300            /* sliding window size (frames) */
-#define JITTER_US     20000          /* 20 ms - anything over this is a jitter */
+#define JITTER_US     20000          /* 20 ms - anything over this is a jitter (unpaced mode) */
 #define PERF_REPORT_INTERVAL 60      /* print summary every N frames */
 
 struct FrameTimings {
     int64_t total_us;
     int64_t engine_us;
-    int64_t swap_us;
+    int64_t swap_us;       /* whole presentation phase: dwm + present + swap call + everything between */
     int64_t sleep_us;
     int64_t heap_delta_allocs;  /* net allocation count (mallocs - frees) this frame */
+    int64_t dwm_us;        /* waiting for the compositor refresh */
+    int64_t present_us;    /* offscreen resolve + blit to the window (stalls here when the GPU is behind) */
+    int64_t swapcall_us;   /* SDL_GL_SwapWindow */
 };
 
 static FrameTimings  s_perf_window[PERF_WINDOW];
@@ -319,35 +332,149 @@ static int64_t       s_frame_jitter_total = 0;  /* jitter count this second */
 static uint64_t s_perf_malloc_prev = 0;
 static uint64_t s_perf_free_prev   = 0;
 
+/* Presentation-path phase timings of the current frame (filled in by the swap code in the main loop) */
+static int64_t s_ph_dwm_us = 0, s_ph_present_us = 0, s_ph_swapcall_us = 0;
+
+/* Run-wide state for the performance log (enabled by --debug or PerfLog = 1 in config.ini) */
+static bool     s_perf_enabled     = false;
+static int64_t  s_perf_start_us    = 0;
+static uint64_t s_run_frames       = 0;
+static uint64_t s_run_over_budget  = 0;   /* frames longer than one refresh + 4 ms */
+static uint64_t s_run_missed_vsync = 0;   /* frames longer than 1.5 refreshes (a visibly repeated frame) */
+static int64_t  s_run_max_total_us = 0;
+static int64_t  s_run_sum_total_us = 0;
+static int64_t  s_sec_over = 0, s_sec_missed = 0;
+static uint32_t s_perf_scene = 0, s_perf_ce_state = 0;   /* current scene / engine state, set by the main loop */
+static uint32_t s_perf_last_scene = 0;
+static int      s_spike_lines_sec = 0;   /* spike lines written this second (capped) */
+/* Host-call profile (PerfProfile = 1): engine time split into bridge calls and guest code, aggregated over slow
+ * frames between scene changes so each level load gets one breakdown line */
+static bool     s_prof_active = false;
+static int64_t  s_load_engine_us = 0;
+static uint32_t s_load_frames = 0;
+static int64_t  s_sec_host_us = 0;
+
+static const char *perf_stamp(void);
+
+static void perf_write_loadprof(const char *label) {
+    if (!s_perf_log || !s_prof_active || s_load_frames == 0) return;
+    char top[512];
+    int64_t host_us = 0;
+    uint32_t calls = 0;
+    host_prof_aggregate_top(8, top, sizeof(top), &host_us, &calls);
+    char hot[900];
+    host_prof_sample_top(8, hot, sizeof(hot));
+    fprintf(s_perf_log, "[LOADPROF %s t=%s] slow_frames=%u engine=%.0fms = host_calls %.0fms (%u calls) + guest_code %.0fms | top: %s\n",
+            label, perf_stamp(), s_load_frames, s_load_engine_us / 1000.0, host_us / 1000.0, calls,
+            (s_load_engine_us - host_us) / 1000.0, top);
+    fprintf(s_perf_log, "[LOADPROF guest hot] %s\n", hot);
+    fflush(s_perf_log);
+    host_prof_aggregate_reset();
+    s_load_engine_us = 0;
+    s_load_frames = 0;
+}
+
 static inline int64_t perf_now_us(void) {
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
     return (t.QuadPart * 1000000LL) / s_perf_qpf;
 }
 
+/* Always initialize the QPC frequency (the frame limiter depends on it in every build) */
 static void perf_init(void) {
     LARGE_INTEGER f;
     QueryPerformanceFrequency(&f);
     s_perf_qpf = f.QuadPart;
+}
 
-    /* Open perf log in the logs/ subdirectory (created at startup) */
-    s_perf_log = fopen("logs/perf.log", "w");
-    if (s_perf_log) {
-        fprintf(s_perf_log,
-            "# Per-frame performance log\n"
-            "# Columns: frame | fps | avg_ms | p50 | p95 | p99 | max_ms"
-            " | engine_ms | swap_ms | sleep_ms | jitter_count | net_allocs_per_frame\n");
-        fflush(s_perf_log);
+/* "HH:MM:SS.mmm" since the log was opened - lets spikes be matched to a run recording */
+static const char *perf_stamp(void) {
+    static char buf[32];
+    int64_t ms = (perf_now_us() - s_perf_start_us) / 1000;
+    if (ms < 0) ms = 0;
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d", (int)(ms / 3600000), (int)((ms / 60000) % 60),
+             (int)((ms / 1000) % 60), (int)(ms % 1000));
+    return buf;
+}
+
+struct PerfMemCounters {
+    DWORD cb;
+    DWORD PageFaultCount;
+    SIZE_T PeakWorkingSetSize;
+    SIZE_T WorkingSetSize;
+    SIZE_T QuotaPeakPagedPoolUsage;
+    SIZE_T QuotaPagedPoolUsage;
+    SIZE_T QuotaPeakNonPagedPoolUsage;
+    SIZE_T QuotaNonPagedPoolUsage;
+    SIZE_T PagefileUsage;
+    SIZE_T PeakPagefileUsage;
+};
+
+static size_t perf_working_set_mb(void) {
+    typedef BOOL (WINAPI *PFN_K32GetProcessMemoryInfo)(HANDLE, PerfMemCounters*, DWORD);
+    static PFN_K32GetProcessMemoryInfo fn = nullptr;
+    static bool resolved = false;
+    if (!resolved) {
+        resolved = true;
+        HMODULE k = GetModuleHandleA("kernel32.dll");
+        if (k) fn = (PFN_K32GetProcessMemoryInfo)(void*)GetProcAddress(k, "K32GetProcessMemoryInfo");
     }
+    PerfMemCounters pmc = {};
+    pmc.cb = sizeof(pmc);
+    if (fn && fn(GetCurrentProcess(), &pmc, sizeof(pmc))) return pmc.WorkingSetSize / (1024 * 1024);
+    return 0;
+}
+
+/* Opens logs/perf_<date>_<time>.log (one file per run) and writes a header describing the setup.
+ * Call after the config is loaded and the GL context / presentation mode are known. */
+static void perf_open_log(void) {
+    s_perf_enabled = g_debug_mode || g_config.perf_log;
+    if (!s_perf_enabled) return;
+    s_prof_active = g_config.perf_profile;
+    host_prof_enable(s_prof_active ? 1 : 0);
+
+    _mkdir("logs");
+    char path[128];
+    time_t now = time(nullptr);
+    struct tm *lt = localtime(&now);
+    if (lt) {
+        snprintf(path, sizeof(path), "logs/perf_%04d%02d%02d_%02d%02d%02d.log",
+                 lt->tm_year + 1900, lt->tm_mon + 1, lt->tm_mday, lt->tm_hour, lt->tm_min, lt->tm_sec);
+    } else {
+        snprintf(path, sizeof(path), "logs/perf_latest.log");
+    }
+    s_perf_log = fopen(path, "w");
+    s_perf_start_us = perf_now_us();
+    if (!s_perf_log) return;
+
+    static const char *mode_names[] = { "off (FPS limiter)", "driver swap interval", "DWM compositor flush",
+                                        "software limiter at refresh rate" };
+    fprintf(s_perf_log, "# Prince of Persia: Shadow and the Flame - Reignited performance log | build=%s\n", BUILD_TAG);
+    fprintf(s_perf_log, "# gpu=\"%s\" | gpu_preference=%d | display=%d Hz\n",
+            s_gl_renderer ? s_gl_renderer : "?", g_config.gpu_preference, s_display_hz);
+    fprintf(s_perf_log, "# window=%dx%d render=%dx%d fullscreen=%d | offscreen=%d msaa_requested=%d | af=%d\n",
+            g_window_width, g_window_height, g_render_width, g_render_height, (int)g_config.fullscreen,
+            (int)s_offscreen, g_config.msaa, g_config.anisotropic);
+    fprintf(s_perf_log, "# vsync=%d mode=%s | fps_limit=%d | vsync_mode_cfg=%d present_delay_ms=%.1f\n",
+            (int)g_config.vsync, mode_names[s_vsync_mode], g_config.fps_limit, g_config.vsync_mode,
+            g_config.present_delay_ms);
+    fprintf(s_perf_log, "# [PERF]: fps avg p50 p95 p99 max (ms/frame) | engine, dwm (refresh wait), present (blit), "
+                        "swap, sleep (avg ms) | over = frames > refresh+4ms, missed = frames > 1.5 refreshes | "
+                        "ws = working set MB | dwm_missed/dropped = compositor counters\n");
+    fprintf(s_perf_log, "# [SPIKE]: single slow frame with its phase breakdown and a likely cause\n");
+    fprintf(s_perf_log, "# profile=%d: spikes show host (bridge calls: file reads, GL uploads, audio...) vs guest (game code + JIT); [LOADPROF] sums slow frames per level load\n", (int)s_prof_active);
+    fflush(s_perf_log);
 }
 
 /* Call at the start of every frame to snapshot heap counters */
 static void perf_frame_begin(void) {
     s_perf_malloc_prev = bridge_libc_get_malloc_count();
     s_perf_free_prev   = bridge_libc_get_free_count();
+    s_ph_dwm_us = s_ph_present_us = s_ph_swapcall_us = 0;
+    if (s_prof_active) host_prof_frame_reset();
 }
 
-/* Record timing and optionally print jitter alert */
+/* Record timing and write spike / per-second lines */
 static void perf_frame_end(int frame_no,
                             int64_t engine_us, int64_t swap_us, int64_t sleep_us) {
     int64_t total_us = engine_us + swap_us + sleep_us;
@@ -355,40 +482,79 @@ static void perf_frame_end(int frame_no,
     uint64_t mallocs_this_frame = bridge_libc_get_malloc_count() - s_perf_malloc_prev;
     uint64_t frees_this_frame   = bridge_libc_get_free_count()   - s_perf_free_prev;
     /* Net allocation count this frame (positive = more mallocs than frees).
-     * Stored as a count, not bytes — we cannot cheaply measure per-frame byte deltas. */
-    int64_t net_allocs = (int64_t)mallocs_this_frame - (int64_t)frees_this_frame;
-    int64_t heap_delta_allocs = net_allocs;
+     * Stored as a count, not bytes - we cannot cheaply measure per-frame byte deltas. */
+    int64_t heap_delta_allocs = (int64_t)mallocs_this_frame - (int64_t)frees_this_frame;
 
-    FrameTimings ft = { total_us, engine_us, swap_us, sleep_us, heap_delta_allocs };
+    FrameTimings ft = { total_us, engine_us, swap_us, sleep_us, heap_delta_allocs,
+                        s_ph_dwm_us, s_ph_present_us, s_ph_swapcall_us };
     s_perf_window[s_perf_head] = ft;
     s_perf_head = (s_perf_head + 1) % PERF_WINDOW;
     if (s_perf_filled < PERF_WINDOW) s_perf_filled++;
 
-    /* Immediate jitter alert */
-    int64_t expected_us = (g_config.fps_limit > 0) ? (1000000LL / g_config.fps_limit) : 16667;
-    int64_t jitter_thresh = (g_config.fps_limit > 0) ? (expected_us + 4000) : JITTER_US;
+    /* Frame budget: one refresh when presentation is vsynced, otherwise the FPS limit */
+    bool paced_by_limit = (s_vsync_mode == VSYNC_OFF) ? (g_config.fps_limit > 0) : (s_display_hz > 0);
+    int64_t expected_us = (s_vsync_mode == VSYNC_OFF)
+        ? ((g_config.fps_limit > 0) ? (1000000LL / g_config.fps_limit) : 16667)
+        : (1000000LL / (s_display_hz > 0 ? s_display_hz : 60));
+    int64_t jitter_thresh = paced_by_limit ? (expected_us + 4000) : JITTER_US;
+
+    s_run_frames++;
+    s_run_sum_total_us += total_us;
+    if (total_us > s_run_max_total_us) s_run_max_total_us = total_us;
+    bool is_missed = paced_by_limit && total_us > (expected_us * 3) / 2;
+    if (total_us >= jitter_thresh) { s_run_over_budget++; s_sec_over++; }
+    if (is_missed) { s_run_missed_vsync++; s_sec_missed++; }
+
+    /* Profile bookkeeping: slow engine frames feed the per-level-load breakdown */
+    int64_t host_frame_us = s_prof_active ? host_prof_frame_total_us() : 0;
+    s_sec_host_us += host_frame_us;
+    if (s_prof_active && engine_us > 30000) {
+        host_prof_aggregate_frame();
+        s_load_engine_us += engine_us;
+        s_load_frames++;
+    }
+
+    /* Scene transitions, so spikes can be matched to level loads */
+    if (s_perf_scene != s_perf_last_scene) {
+        perf_write_loadprof("before scene change");
+        if (s_perf_log) {
+            fprintf(s_perf_log, "[SCENE t=%s f=%d] scene 0x%08X -> 0x%08X ce_state=%u play=%d\n", perf_stamp(), frame_no,
+                    s_perf_last_scene, s_perf_scene, s_perf_ce_state, (int)soft_mods_is_in_gameplay());
+            fflush(s_perf_log);
+        }
+        s_perf_last_scene = s_perf_scene;
+    }
+
+    /* Immediate spike line */
     if (total_us >= jitter_thresh) {
         s_frame_jitter_total++;
-        printf("[JITTER f=%d] total=%.2fms  engine=%.2fms  swap=%.2fms  sleep=%.2fms"
-               "  heap_delta=%+ld allocs%s\n",
-               frame_no,
-               total_us  / 1000.0,
-               engine_us / 1000.0,
-               swap_us   / 1000.0,
-               sleep_us  / 1000.0,
-               (long)heap_delta_allocs,
-               (heap_delta_allocs > 512) ? "  <-- asset load spike?" : "");
-        if (s_perf_log) {
+        const char *cause = "other";
+        if (engine_us > 8000)                           cause = "engine/CPU (asset load or heavy logic)";
+        else if (heap_delta_allocs > 512)               cause = "allocation burst (asset load)";
+        else if (s_ph_present_us > 4000)                cause = "GPU behind (present blit stalled)";
+        else if (s_ph_dwm_us > expected_us + 2000)      cause = "compositor wait overran (missed refresh)";
+        else if (s_ph_swapcall_us > 4000)               cause = "swap call stalled";
+        else if (sleep_us > expected_us)                cause = "limiter";
+        if (g_debug_mode) {
+            printf("[SPIKE f=%d] total=%.2fms engine=%.2f dwm=%.2f present=%.2f swap=%.2f sleep=%.2f heap=%+ld -> %s\n",
+                   frame_no, total_us / 1000.0, engine_us / 1000.0, s_ph_dwm_us / 1000.0, s_ph_present_us / 1000.0,
+                   s_ph_swapcall_us / 1000.0, sleep_us / 1000.0, (long)heap_delta_allocs, cause);
+        }
+        /* Cap spike lines per second so a sustained slowdown cannot bloat the log (the PERF line still counts them) */
+        if (s_perf_log && s_spike_lines_sec++ < 10) {
+            char prof[600] = "";
+            if (s_prof_active && engine_us > 8000) {
+                char top[400];
+                host_prof_frame_top(5, top, sizeof(top));
+                snprintf(prof, sizeof(prof), " | host=%.2fms/%u guest=%.2fms top: %s", host_frame_us / 1000.0,
+                         host_prof_frame_calls(), (engine_us - host_frame_us) / 1000.0, top);
+            }
             fprintf(s_perf_log,
-                    "[JITTER f=%d] total=%.2fms  engine=%.2fms  swap=%.2fms  sleep=%.2fms"
-                    "  heap_delta=%+ld allocs%s\n",
-                    frame_no,
-                    total_us  / 1000.0,
-                    engine_us / 1000.0,
-                    swap_us   / 1000.0,
-                    sleep_us  / 1000.0,
-                    (long)heap_delta_allocs,
-                    (heap_delta_allocs > 512) ? "  <-- asset load spike?" : "");
+                    "[SPIKE t=%s f=%d] total=%.2fms engine=%.2f dwm=%.2f present=%.2f swap=%.2f sleep=%.2f"
+                    " heap=%+ld scene=0x%08X ce=%u play=%d -> %s%s\n",
+                    perf_stamp(), frame_no, total_us / 1000.0, engine_us / 1000.0, s_ph_dwm_us / 1000.0,
+                    s_ph_present_us / 1000.0, s_ph_swapcall_us / 1000.0, sleep_us / 1000.0, (long)heap_delta_allocs,
+                    s_perf_scene, s_perf_ce_state, (int)soft_mods_is_in_gameplay(), cause, prof);
             fflush(s_perf_log);
         }
     }
@@ -413,39 +579,80 @@ static void perf_frame_end(int frame_no,
 
         /* Averages */
         int64_t sum_total = 0, sum_eng = 0, sum_swap = 0, sum_slp = 0, sum_hdelta = 0;
+        int64_t sum_dwm = 0, sum_pres = 0, sum_swc = 0;
         for (int i = 0; i < n; ++i) {
             sum_total  += s_perf_window[i].total_us;
             sum_eng    += s_perf_window[i].engine_us;
             sum_swap   += s_perf_window[i].swap_us;
             sum_slp    += s_perf_window[i].sleep_us;
             sum_hdelta += s_perf_window[i].heap_delta_allocs;
+            sum_dwm    += s_perf_window[i].dwm_us;
+            sum_pres   += s_perf_window[i].present_us;
+            sum_swc    += s_perf_window[i].swapcall_us;
         }
         double avg_ms  = (sum_total  / (double)n) / 1000.0;
         double eng_ms  = (sum_eng    / (double)n) / 1000.0;
         double swap_ms = (sum_swap   / (double)n) / 1000.0;
         double slp_ms  = (sum_slp    / (double)n) / 1000.0;
+        double dwm_ms  = (sum_dwm    / (double)n) / 1000.0;
+        double pres_ms = (sum_pres   / (double)n) / 1000.0;
+        double swc_ms  = (sum_swc    / (double)n) / 1000.0;
         double fps     = (avg_ms > 0.0) ? (1000.0 / avg_ms) : 0.0;
         int64_t avg_hdelta = sum_hdelta / n;
 
-        const char *line_fmt =
-            "[PERF f=%d] fps=%.1f  avg=%.2fms  p50=%.2f  p95=%.2f  p99=%.2f  max=%.2f"
-            "  engine=%.2fms  swap=%.2fms  sleep=%.2fms  jitter=%lld  heap_delta=%+ld allocs/f\n";
+        /* Compositor counters (deltas since the previous summary) */
+        static uint64_t s_last_missed = 0, s_last_dropped = 0;
+        long dwm_missed = 0, dwm_dropped = 0;
+        if (s_pfn_DwmGetCompositionTimingInfo) {
+            DWM_TIMING_INFO timing = {};
+            timing.cbSize = sizeof(timing);
+            if (SUCCEEDED(s_pfn_DwmGetCompositionTimingInfo(NULL, &timing))) {
+                dwm_missed  = (long)(timing.cFramesMissed  - s_last_missed);
+                dwm_dropped = (long)(timing.cFramesDropped - s_last_dropped);
+                s_last_missed  = timing.cFramesMissed;
+                s_last_dropped = timing.cFramesDropped;
+            }
+        }
 
-        printf(line_fmt, frame_no, fps, avg_ms,
-               p50/1000.0, p95/1000.0, p99/1000.0, tmax/1000.0,
-               eng_ms, swap_ms, slp_ms,
-               (long long)s_frame_jitter_total, (long)avg_hdelta);
-
+        if (g_debug_mode) {
+            printf("[PERF f=%d] fps=%.1f  avg=%.2fms  p50=%.2f  p95=%.2f  p99=%.2f  max=%.2f"
+                   "  engine=%.2fms  swap=%.2fms  sleep=%.2fms  jitter=%lld  heap_delta=%+ld allocs/f\n",
+                   frame_no, fps, avg_ms, p50/1000.0, p95/1000.0, p99/1000.0, tmax/1000.0,
+                   eng_ms, swap_ms, slp_ms, (long long)s_frame_jitter_total, (long)avg_hdelta);
+        }
         if (s_perf_log) {
-            fprintf(s_perf_log, line_fmt, frame_no, fps, avg_ms,
-                    p50/1000.0, p95/1000.0, p99/1000.0, tmax/1000.0,
-                    eng_ms, swap_ms, slp_ms,
-                    (long long)s_frame_jitter_total, (long)avg_hdelta);
+            fprintf(s_perf_log,
+                    "[PERF t=%s f=%d] fps=%.1f avg=%.2f p50=%.2f p95=%.2f p99=%.2f max=%.2f | engine=%.2f dwm=%.2f"
+                    " present=%.2f swap=%.2f sleep=%.2f | over=%lld missed=%lld | heap=%+ld/f ws=%zuMB"
+                    " dwm_missed=%+ld dropped=%+ld | host=%.2f | play=%d\n",
+                    perf_stamp(), frame_no, fps, avg_ms, p50/1000.0, p95/1000.0, p99/1000.0, tmax/1000.0,
+                    eng_ms, dwm_ms, pres_ms, swc_ms, slp_ms, (long long)s_sec_over, (long long)s_sec_missed,
+                    (long)avg_hdelta, perf_working_set_mb(), dwm_missed, dwm_dropped,
+                    s_prof_active ? (s_sec_host_us / (double)PERF_REPORT_INTERVAL) / 1000.0 : 0.0,
+                    (int)soft_mods_is_in_gameplay());
             fflush(s_perf_log);
         }
 
         s_frame_jitter_total = 0;
+        s_sec_over = 0;
+        s_sec_missed = 0;
+        s_spike_lines_sec = 0;
+        s_sec_host_us = 0;
     }
+}
+
+/* Final run summary, written on a clean exit */
+static void perf_write_summary(void) {
+    if (!s_perf_log || s_run_frames == 0) return;
+    perf_write_loadprof("final");
+    fprintf(s_perf_log,
+            "[SUMMARY t=%s] frames=%llu avg=%.2fms (%.1f fps) max=%.2fms over_budget=%llu (%.2f%%) missed_refresh=%llu (%.3f%%)\n",
+            perf_stamp(), (unsigned long long)s_run_frames,
+            (s_run_sum_total_us / (double)s_run_frames) / 1000.0,
+            1000000.0 / (s_run_sum_total_us / (double)s_run_frames), s_run_max_total_us / 1000.0,
+            (unsigned long long)s_run_over_budget, 100.0 * s_run_over_budget / s_run_frames,
+            (unsigned long long)s_run_missed_vsync, 100.0 * s_run_missed_vsync / s_run_frames);
+    fflush(s_perf_log);
 }
 
 /* Android keycodes (standard Android KeyEvent values) */
@@ -867,20 +1074,24 @@ int main(int argc, char *argv[]) {
             // Icons sit at phone y≈815 (very bottom strip), phone x≈230/315/400/480.
             } else if (strcmp(aname, "weapons") == 0) {
                 click3_name = "weapons";
-                click3_frame = 200;
-                click3_x = 202.0f; click3_y = 695.0f;
+                click3_frame = 250;
+                click3_x = 280.0f; click3_y = 960.0f;
+                if (max_frames < 320) max_frames = 320;
             } else if (strcmp(aname, "potions") == 0) {
                 click3_name = "potions";
-                click3_frame = 200;
-                click3_x = 277.0f; click3_y = 695.0f;
+                click3_frame = 250;
+                click3_x = 712.0f; click3_y = 892.0f;
+                if (max_frames < 320) max_frames = 320;
             } else if (strcmp(aname, "combos") == 0) {
                 click3_name = "combos";
-                click3_frame = 200;
-                click3_x = 352.0f; click3_y = 695.0f;
+                click3_frame = 250;
+                click3_x = 560.0f; click3_y = 960.0f;
+                if (max_frames < 320) max_frames = 320;
             } else if (strcmp(aname, "bundles") == 0) {
                 click3_name = "bundles";
-                click3_frame = 200;
-                click3_x = 422.0f; click3_y = 695.0f;
+                click3_frame = 250;
+                click3_x = 700.0f; click3_y = 960.0f;
+                if (max_frames < 320) max_frames = 320;
             } else if (strcmp(aname, "buy") == 0 || strcmp(aname, "buy_sword") == 0) {
                 click3_name = "buy_sword";
                 click3_frame = 230;
@@ -897,10 +1108,10 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("===============================================================\n");
-    printf(" Prince of Persia: The Shadow and the Flame - Native PC Port [%s]\n", BUILD_TAG);
+    printf("=============================================================================\n");
+    printf(" Prince of Persia: Shadow and the Flame - Reignited [%s]\n", BUILD_TAG);
     printf(" Mode: %s\n", g_debug_mode ? "DEBUG (telemetry, logging, and profiling enabled)" : "PRODUCTION (optimized)");
-    printf("===============================================================\n");
+    printf("=============================================================================\n");
     if (max_frames > 0) {
         printf("[+] Running with frame limit: %d frames\n", max_frames);
     }
@@ -977,12 +1188,30 @@ int main(int argc, char *argv[]) {
         win_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
     }
 
+    const char *win_title = g_debug_mode
+        ? "Prince of Persia: Shadow and the Flame - Reignited [" BUILD_TAG "]"
+        : "Prince of Persia: Shadow and the Flame - Reignited";
+
     SDL_Window *window = SDL_CreateWindow(
-        "Prince of Persia: The Shadow and the Flame [" BUILD_TAG "]",
+        win_title,
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         g_window_width, g_window_height,
         win_flags
     );
+
+    // Requested MSAA level may be unsupported by the GPU/driver: step down until a pixel format works
+    for (int samples = (g_config.msaa > 2) ? g_config.msaa / 2 : 0; !window && g_config.msaa > 0; samples = (samples > 2) ? samples / 2 : 0) {
+        fprintf(stderr, "[!] %dx MSAA unsupported, retrying with %dx\n", g_config.msaa, samples);
+        g_config.msaa = samples;
+        SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, samples > 0 ? 1 : 0);
+        SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, samples);
+        window = SDL_CreateWindow(
+            win_title,
+            SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+            g_window_width, g_window_height,
+            win_flags
+        );
+    }
 
     if (!window) {
         fprintf(stderr, "[-] SDL_CreateWindow failed: %s\n", SDL_GetError());
@@ -1031,16 +1260,15 @@ int main(int argc, char *argv[]) {
     // stall at 30 FPS (double-buffer queue stall) or not block at all (tearing).
     // Fall back to swap_interval=0 + DWM + software hybrid-sleep limiter instead.
     bool is_optimus_dgpu = topo.is_hybrid_system && !is_igpu;
-    if (is_optimus_dgpu) {
-        printf("[!] Optimus/hybrid dGPU active: driver VSync unreliable over PCIe cross-adapter "
-               "path. Using software frame limiter + DWM composition for tear-free output.\n");
+    if (is_optimus_dgpu && g_debug_mode) {
+        printf("[+] Optimus/hybrid dGPU active (frames are copied to the display-attached iGPU).\n");
     }
     // Warn about one-launch delay: GPUPreference=2 is set, but NvOptimusEnablement=0
     // on this binary told the driver to use the iGPU for *this* launch. The registry
     // key written by apply_windows_gpu_preference() takes effect on the next launch.
     if (topo.is_hybrid_system && is_igpu && g_config.gpu_preference == 2) {
-        printf("[!] GPUPreference=2 (High Performance GPU) set but takes effect on the NEXT launch. "
-               "Running on integrated GPU this session.\n");
+        printf("[!] GPUPreference=2 (High Performance GPU) is set but the integrated GPU is active. "
+               "If the exe was started directly (not via the launcher), the registry preference applies on the NEXT launch.\n");
     }
 #else
     bool is_optimus_dgpu = false;
@@ -1052,11 +1280,14 @@ int main(int argc, char *argv[]) {
     //   Optimus dGPU: same as iGPU — driver VSync unreliable over PCIe cross-adapter path.
     //   Desktop dGPU: swap=vsync ? 1 : 0 — driver VSync works correctly on a single GPU
     //                 directly wired to the display.
-    int swap_interval;
-    if (is_igpu || is_optimus_dgpu) {
-        swap_interval = 0;
-    } else {
-        swap_interval = (g_config.vsync ? 1 : 0);
+    // VSyncMode in config.ini: 0 = auto, 1 = force driver swap interval, 2 = force DWM flush pacing.
+    // Auto uses the driver swap interval on discrete GPUs (including the dGPU of a hybrid laptop, where
+    // the DWM-only path was observed to tear) and DWM pacing on integrated GPUs.
+    int swap_interval = 0;
+    if (g_config.vsync) {
+        if (g_config.vsync_mode == 1) swap_interval = 1;
+        else if (g_config.vsync_mode == 2) swap_interval = 0;
+        else swap_interval = is_igpu ? 0 : 1;
     }
     int vsync_res = SDL_GL_SetSwapInterval(swap_interval);
     if (vsync_res < 0) {
@@ -1072,6 +1303,28 @@ int main(int argc, char *argv[]) {
     SDL_GL_GetAttribute(SDL_GL_MULTISAMPLESAMPLES, &ms_samp);
     int swap_ctrl = SDL_GL_GetSwapInterval();
     s_swap_control = swap_ctrl;
+
+    // Resolve how presentation is paced. VSync on means the display refresh paces the game and the
+    // FPS limit is ignored; VSync off means the FPS limit paces it.
+    if (g_config.vsync) {
+        if (swap_ctrl > 0) {
+            s_vsync_mode = VSYNC_DRIVER;
+        }
+#ifdef _WIN32
+        else if (s_pfn_DwmFlush) {
+            s_vsync_mode = VSYNC_DWM;
+        }
+#endif
+        else {
+            s_vsync_mode = VSYNC_SOFTWARE;
+        }
+    } else {
+        s_vsync_mode = VSYNC_OFF;
+    }
+    if (g_debug_mode) {
+        static const char *mode_names[] = { "off (FPS limiter)", "driver swap interval", "DWM compositor flush", "software limiter at refresh rate" };
+        printf("[+] Frame pacing: %s\n", mode_names[s_vsync_mode]);
+    }
     if (g_debug_mode) {
         printf("[+] GL Attributes: DoubleBuffer=%d, MultiSampleBuffers=%d, Samples=%d, SwapControl=%d\n",
                db, ms_buf, ms_samp, swap_ctrl);
@@ -1096,8 +1349,27 @@ int main(int argc, char *argv[]) {
     show_startup_splash(window);
 
     bridge_gles_init();
+
+    // Hybrid-laptop dGPUs hand out a window framebuffer with no MSAA and an ignored swap interval. Render into our
+    // own (multisampled) framebuffer instead and present it with one short, vblank-aligned blit.
+    if (is_optimus_dgpu || (g_config.msaa > 0 && ms_buf == 0)) {
+        int off_samples = bridge_gles_offscreen_init(g_render_width, g_render_height, g_config.msaa);
+        if (off_samples >= 0) {
+            s_offscreen = true;
+            printf("[+] Offscreen framebuffer active (%dx%d, %dx MSAA)\n", g_render_width, g_render_height, off_samples);
+        } else {
+            fprintf(stderr, "[-] Offscreen framebuffer unavailable; using the window framebuffer directly.\n");
+        }
+    }
+    perf_open_log();
     bridge_openal_init();
     bridge_libc_set_root_dir(".");
+
+    // Clean up any stray temporary files left on disk by earlier unpatched builds
+    remove(".nomedia");
+    remove("./.nomedia");
+    remove("~tempgd!ms!k!gr!c!m!gff!crs.xkv");
+    remove("~tempgd!ms!k!gr!c!m!n!g!q.xkv");
 
     // Guest address space size: 512 MB provides 448 MB for the segregated free-list heap
     // (active gameplay stabilizes at ~45-70 MB) and 32 MB for the ARM stack, reducing
@@ -1111,6 +1383,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "[-] Failed to allocate guest image!\n");
         return 1;
     }
+    g_guest_memory_base = img->mem;
     bridge_libc_init_heap(img);
 
     // Set up Android JNI and JavaVM tables in guest memory
@@ -1606,7 +1879,7 @@ int main(int argc, char *argv[]) {
                     else if (dx > 0) wheel_bind = MOUSE_BIND_WHEEL_RIGHT;
                     else if (dx < 0) wheel_bind = MOUSE_BIND_WHEEL_LEFT;
 
-                    if (wheel_bind != 0) {
+                    if (wheel_bind != 0 && soft_mods_is_in_gameplay()) {
                         int target_key = 0;
                         if (wheel_bind == g_config.key_up || (g_config.key_sec_up && wheel_bind == g_config.key_sec_up))
                             target_key = AKEYCODE_DPAD_UP;
@@ -1674,29 +1947,49 @@ int main(int argc, char *argv[]) {
                     int down = (event.type == SDL_MOUSEBUTTONDOWN);
                     int mouse_bind = mouse_to_bind(event.button.button);
 
-                    // Check configured action remappings for mouse
-                    if (mouse_bind == g_config.key_up || (g_config.key_sec_up && mouse_bind == g_config.key_sec_up))
-                        send_key(host, AKEYCODE_DPAD_UP, down);
-                    else if (mouse_bind == g_config.key_down || (g_config.key_sec_down && mouse_bind == g_config.key_sec_down))
-                        send_key(host, AKEYCODE_DPAD_DOWN, down);
-                    else if (mouse_bind == g_config.key_left || (g_config.key_sec_left && mouse_bind == g_config.key_sec_left))
-                        send_key(host, AKEYCODE_DPAD_LEFT, down);
-                    else if (mouse_bind == g_config.key_right || (g_config.key_sec_right && mouse_bind == g_config.key_sec_right))
-                        send_key(host, AKEYCODE_DPAD_RIGHT, down);
-                    else if (mouse_bind == g_config.key_attack || (g_config.key_sec_attack && mouse_bind == g_config.key_sec_attack))
-                        send_key(host, AKEYCODE_BUTTON_Y, down);
-                    else if (mouse_bind == g_config.key_jump || (g_config.key_sec_jump && mouse_bind == g_config.key_sec_jump))
-                        send_key(host, AKEYCODE_BUTTON_X, down);
-                    else if (mouse_bind == g_config.key_roll || (g_config.key_sec_roll && mouse_bind == g_config.key_sec_roll))
-                        send_key(host, AKEYCODE_DPAD_CENTER, down);
-                    else if (mouse_bind == g_config.key_block || (g_config.key_sec_block && mouse_bind == g_config.key_sec_block))
-                        send_key(host, AKEYCODE_BUTTON_L1, down);
-                    else if (mouse_bind == g_config.key_potion || (g_config.key_sec_potion && mouse_bind == g_config.key_sec_potion))
-                        send_key(host, AKEYCODE_BUTTON_R1, down);
-                    else if (mouse_bind == g_config.key_back || (g_config.key_sec_back && mouse_bind == g_config.key_sec_back))
-                        send_key(host, AKEYCODE_BACK, down);
-                    else if (mouse_bind == g_config.key_pause || (g_config.key_sec_pause && mouse_bind == g_config.key_sec_pause))
-                        send_key(host, AKEYCODE_BUTTON_START, down);
+                    // Track active mouse-down key so release is always paired
+                    static int s_active_mouse_key = 0;
+
+                    // Action keys from mouse inputs are state-gated: only active in gameplay.
+                    // In menus/dialogs, mouse buttons act strictly as UI pointer clicks to prevent
+                    // controller shortcuts (e.g. Y=Store, Return=Confirm) from preempting clicks.
+                    {
+                        const bool in_gameplay = soft_mods_is_in_gameplay();
+                        int target_key = 0;
+                        if (mouse_bind == g_config.key_up || (g_config.key_sec_up && mouse_bind == g_config.key_sec_up))
+                            target_key = AKEYCODE_DPAD_UP;
+                        else if (mouse_bind == g_config.key_down || (g_config.key_sec_down && mouse_bind == g_config.key_sec_down))
+                            target_key = AKEYCODE_DPAD_DOWN;
+                        else if (mouse_bind == g_config.key_left || (g_config.key_sec_left && mouse_bind == g_config.key_sec_left))
+                            target_key = AKEYCODE_DPAD_LEFT;
+                        else if (mouse_bind == g_config.key_right || (g_config.key_sec_right && mouse_bind == g_config.key_sec_right))
+                            target_key = AKEYCODE_DPAD_RIGHT;
+                        else if (mouse_bind == g_config.key_attack || (g_config.key_sec_attack && mouse_bind == g_config.key_sec_attack))
+                            target_key = AKEYCODE_BUTTON_Y;
+                        else if (mouse_bind == g_config.key_jump || (g_config.key_sec_jump && mouse_bind == g_config.key_sec_jump))
+                            target_key = AKEYCODE_BUTTON_X;
+                        else if (mouse_bind == g_config.key_roll || (g_config.key_sec_roll && mouse_bind == g_config.key_sec_roll))
+                            target_key = AKEYCODE_DPAD_CENTER;
+                        else if (mouse_bind == g_config.key_block || (g_config.key_sec_block && mouse_bind == g_config.key_sec_block))
+                            target_key = AKEYCODE_BUTTON_L1;
+                        else if (mouse_bind == g_config.key_potion || (g_config.key_sec_potion && mouse_bind == g_config.key_sec_potion))
+                            target_key = AKEYCODE_BUTTON_R1;
+                        else if (mouse_bind == g_config.key_back || (g_config.key_sec_back && mouse_bind == g_config.key_sec_back))
+                            target_key = AKEYCODE_BACK;
+                        else if (mouse_bind == g_config.key_pause || (g_config.key_sec_pause && mouse_bind == g_config.key_sec_pause))
+                            target_key = AKEYCODE_BUTTON_START;
+
+                        // Back / Pause stay usable from the mouse in menus (e.g. to unpause)
+                        const bool always_allowed = (target_key == AKEYCODE_BACK || target_key == AKEYCODE_BUTTON_START);
+                        if (target_key != 0 && down && (in_gameplay || always_allowed)) {
+                            send_key(host, target_key, 1);
+                            s_active_mouse_key = target_key;
+                        } else if (target_key != 0 && !down && s_active_mouse_key == target_key) {
+                            // Release is always paired with its press, even if gameplay state changed meanwhile
+                            send_key(host, target_key, 0);
+                            s_active_mouse_key = 0;
+                        }
+                    }
 
                     // Left mouse button also delivers UI click/touch events for menus & UI
                     if (event.button.button == SDL_BUTTON_LEFT) {
@@ -1736,7 +2029,7 @@ int main(int argc, char *argv[]) {
         int64_t t_swap_start      = t_frame_start; /* hoisted; set inside engine block */
         int64_t t_swap_end        = t_frame_start;
         int64_t t_housekeeping_end = t_frame_start; /* hoisted; set after resetStringPool */
-        if (g_debug_mode) {
+        if (s_perf_enabled) {
             perf_frame_begin();
         }
 
@@ -1963,7 +2256,7 @@ int main(int argc, char *argv[]) {
             }
 
             t_swap_start = perf_now_us();
-            if (s_scaling_active) {
+            if (s_scaling_active && !s_offscreen) {
                 bridge_gles_render_letterbox_bars(g_window_width, g_window_height);
             }
 
@@ -1984,11 +2277,37 @@ int main(int argc, char *argv[]) {
 
             static LARGE_INTEGER s_qpc_swap_end = {};
             if (do_swap) {
+                // Submit the frame's rendering. (glFinish would also wait for the previous frame's present to be
+                // consumed by the compositor, costing a whole extra refresh interval on hybrid GPUs.)
+                if (s_offscreen) glFlush();
+                int64_t t_ph0 = perf_now_us();
+#ifdef _WIN32
+                // With the driver swap interval at 0, wait for the compositor's vblank BEFORE presenting so
+                // the swap lands right after a refresh instead of mid-scanout.
+                if (s_vsync_mode == VSYNC_DWM) {
+                    s_pfn_DwmFlush();
+                    // Optional extra wait so the present copy lands clear of the compositor's own pass
+                    if (g_config.present_delay_ms > 0.0f) {
+                        int64_t t0 = perf_now_us();
+                        int64_t delay_us = (int64_t)(g_config.present_delay_ms * 1000.0f);
+                        int64_t coarse_ms = (delay_us - 1500) / 1000;
+                        if (coarse_ms > 0) SDL_Delay((Uint32)coarse_ms);
+                        while (perf_now_us() - t0 < delay_us) _mm_pause();
+                    }
+                }
+#endif
+                int64_t t_ph1 = perf_now_us();
+                if (s_offscreen) bridge_gles_present(g_window_width, g_window_height);
+                int64_t t_ph2 = perf_now_us();
                 SDL_GL_SwapWindow(window);
+                s_ph_dwm_us      = t_ph1 - t_ph0;
+                s_ph_present_us  = t_ph2 - t_ph1;
+                s_ph_swapcall_us = perf_now_us() - t_ph2;
 #ifdef _WIN32
                 QueryPerformanceCounter(&s_qpc_swap_end);
 #endif
             }
+            if (s_offscreen) bridge_gles_begin_frame();
             t_swap_end = perf_now_us();
 
 
@@ -2033,18 +2352,13 @@ int main(int argc, char *argv[]) {
             // FIRST seen in, and scene transitions get their own [SCENE]
             // log line the moment they happen.
             bridge_libc_set_scene_context(p0_scene, game_ptr, ce_state, (uint32_t)s_frame_cnt);
+            s_perf_scene = p0_scene;
+            s_perf_ce_state = ce_state;
 
-            if (p_arr) {
-                for (uint32_t pi = 0; pi < game_players && pi < 8; ++pi) {
-                    uint32_t p = *(uint32_t*)(img->mem + p_arr + pi * 4);
-                    if (p) {
-                        uint32_t h = *(uint32_t*)(img->mem + p + 0x28);
-                        uint32_t sc = *(uint32_t*)(img->mem + p + 0x2c);
-                        if (h) {
-                            soft_mods_apply_hud(img, h, sc);
-                        }
-                    }
-                }
+            if (p0) {
+                soft_mods_apply_hud(img, p0, p0_hud, p0_scene);
+            } else {
+                soft_mods_apply_hud(img, 0, 0, 0);
             }
 
             // Track CE state transitions & print telemetry once per real-world second (regardless of framerate)
@@ -2100,7 +2414,7 @@ int main(int argc, char *argv[]) {
                             s_last_dwm_dropped = timing.cFramesDropped;
                             s_last_dwm_missed = timing.cFramesMissed;
 
-                            bool vsync_active = g_config.vsync && (s_swap_control > 0 || (s_dwm_composition_enforced && is_igpu));
+                            bool vsync_active = (s_vsync_mode == VSYNC_DRIVER || s_vsync_mode == VSYNC_DWM);
                             bool is_tearing_risk = !vsync_active;
                             const char *status_str = "TEAR_FREE (Display Scanout Synced)";
                             if (!g_config.vsync) {
@@ -2229,7 +2543,14 @@ int main(int argc, char *argv[]) {
             }
 
             int64_t elapsed_us = perf_now_us() - t_frame_start;
-            int64_t target_us  = (g_config.fps_limit > 0) ? (1000000LL / g_config.fps_limit) : 0;
+            // Driver / DWM VSync already block for the display refresh, so the FPS limit only applies
+            // when VSync is off; the software fallback paces at the display refresh rate.
+            int64_t target_us  = 0;
+            if (s_vsync_mode == VSYNC_OFF) {
+                target_us = (g_config.fps_limit > 0) ? (1000000LL / g_config.fps_limit) : 0;
+            } else if (s_vsync_mode == VSYNC_SOFTWARE) {
+                target_us = 1000000LL / (s_display_hz > 0 ? s_display_hz : 60);
+            }
             int64_t sleep_us   = 0;
             bool should_software_limit = (target_us > 0);
             if (should_software_limit && elapsed_us < target_us) {
@@ -2250,7 +2571,7 @@ int main(int argc, char *argv[]) {
                 sleep_us = perf_now_us() - t_sleep_start;
             }
 
-            if (g_debug_mode && s_sym_engineRunOneFrame) {
+            if (s_perf_enabled && s_sym_engineRunOneFrame) {
                 static int s_perf_frame_no = 0;
                 perf_frame_end(++s_perf_frame_no, engine_us, swap_us, sleep_us);
             }
@@ -2279,6 +2600,7 @@ int main(int argc, char *argv[]) {
     dynarmic_host_destroy(host);
     elf32_image_destroy(img);
     bridge_openal_shutdown();
+    bridge_libc_cleanup_mem_vfs();
 
     if (controller) SDL_GameControllerClose(controller);
     SDL_GL_DeleteContext(gl_ctx);
@@ -2287,6 +2609,7 @@ int main(int argc, char *argv[]) {
 
 #ifdef _WIN32
     timeEndPeriod(1);
+    perf_write_summary();
     if (s_perf_log) { fclose(s_perf_log); s_perf_log = nullptr; }
     if (s_log_file) { fclose(s_log_file); s_log_file = nullptr; }
     if (s_archive_log_file) { fclose(s_archive_log_file); s_archive_log_file = nullptr; }
