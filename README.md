@@ -1,3 +1,5 @@
+<img width="512" height="179" alt="logo_reignited_cropped" src="https://github.com/user-attachments/assets/4e699269-2891-492f-ba04-183184f5f0b5" />
+
 # Prince of Persia: The Shadow and the Flame - Native PC Port
 
 An authentic, native Windows x64 PC port of **Prince of Persia: The Shadow and the Flame** (ShiVa3D engine Android/iOS remake), running natively via Dynarmic ARMv7 JIT dynamic binary retranslation, Desktop OpenGL, OpenAL, and SDL2.
